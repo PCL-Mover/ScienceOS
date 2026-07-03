@@ -89,6 +89,7 @@ struct exfat_boot_info {
     int commit_ready;
     uint64_t commit_write_count;
     int commit_verified;
+    int write_whitelisted;
     int upcase_table_present;
     uint32_t upcase_table_checksum;
     uint32_t upcase_table_cluster;
@@ -148,7 +149,6 @@ struct blockfs_mount {
 static struct blockfs_mount mounts[BLOCKFS_MAX_MOUNTS];
 
 static void commit_exfat_create_transaction_for_test(struct blockfs_mount *mount);
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 static int refresh_exfat_test_file_size_for_test(struct blockfs_mount *mount,
                                                  struct exfat_root_entry *entry,
                                                  uint64_t size);
@@ -157,7 +157,6 @@ static int create_exfat_test_file_with_clusters_for_test(struct blockfs_mount *m
                                                          const char *path,
                                                          uint64_t requested_clusters);
 static int unlink_exfat_test_file_for_test(struct blockfs_mount *mount, const char *path);
-#endif
 static struct exfat_root_entry *find_exfat_root_entry(struct blockfs_mount *mount, const char *path);
 
 static int chars_equal(const char *a, const char *b) {
@@ -174,6 +173,36 @@ static int chars_equal(const char *a, const char *b) {
     }
 
     return *a == '\0' && *b == '\0';
+}
+
+static char ascii_upper(char c) {
+    if (c >= 'a' && c <= 'z') {
+        return (char)(c - ('a' - 'A'));
+    }
+    return c;
+}
+
+static int chars_equal_ascii_ci(const char *a, const char *b) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+
+    while (*a != '\0' && *b != '\0') {
+        if (ascii_upper(*a) != ascii_upper(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+static int mount_path_equal(struct blockfs_mount *mount, const char *a, const char *b) {
+    if (mount != 0 && mount->fat32.present) {
+        return chars_equal_ascii_ci(a, b);
+    }
+    return chars_equal(a, b);
 }
 
 static void copy_limited(char *dst, uint64_t dst_len, const char *src) {
@@ -194,7 +223,6 @@ static void copy_limited(char *dst, uint64_t dst_len, const char *src) {
     dst[i] = '\0';
 }
 
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 static uint64_t cstr_length(const char *s) {
     uint64_t len = 0;
 
@@ -206,7 +234,6 @@ static uint64_t cstr_length(const char *s) {
     }
     return len;
 }
-#endif
 
 static void copy_bytes(void *dst, const void *src, uint64_t size) {
     uint8_t *d = dst;
@@ -257,7 +284,6 @@ static void write_le64(uint8_t *data, uint64_t value) {
     write_le32(data + 4, (uint32_t)(value >> 32));
 }
 
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 typedef int (*exfat_sector_mutator_fn)(uint8_t *sector, void *context);
 
 struct exfat_bit_patch {
@@ -444,7 +470,6 @@ static int exfat_sector_transaction_commit_for_test(struct exfat_sector_transact
     }
     return exfat_sector_transaction_verify_for_test(tx);
 }
-#endif
 
 static int bytes_equal(const uint8_t *data, const char *text, uint64_t len) {
     for (uint64_t i = 0; i < len; i++) {
@@ -844,7 +869,8 @@ static struct exfat_root_entry *add_exfat_root_entry(struct blockfs_mount *mount
 }
 
 static int parse_exfat_directory_sector(struct blockfs_mount *mount, const uint8_t *sector,
-                                        const char *parent, uint64_t *stop) {
+                                        const char *parent, uint64_t directory_lba,
+                                        uint64_t *stop) {
     uint64_t slots = 512 / EXFAT_ENTRY_SIZE;
     for (uint64_t slot = 0; slot < slots;) {
         const uint8_t *entry = sector + slot * EXFAT_ENTRY_SIZE;
@@ -891,7 +917,13 @@ static int parse_exfat_directory_sector(struct blockfs_mount *mount, const uint8
             }
         }
 
-        add_exfat_root_entry(mount, parent, name, size, first_cluster, attributes, stream_flags);
+        struct exfat_root_entry *root_entry =
+            add_exfat_root_entry(mount, parent, name, size, first_cluster, attributes,
+                                 stream_flags);
+        if (root_entry != 0) {
+            root_entry->directory_lba = directory_lba;
+            root_entry->directory_byte_offset = slot * EXFAT_ENTRY_SIZE;
+        }
         slot += secondary_count + 1;
     }
     return 0;
@@ -1005,15 +1037,12 @@ static void reset_exfat_transaction_plan(struct blockfs_mount *mount) {
     mount->exfat.patched_directory_file_size = 0;
     mount->exfat.patched_directory_name_length = 0;
     mount->exfat.patched_directory_name_matches = 0;
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
-    mount->exfat.commit_supported = 1;
-#else
     mount->exfat.commit_supported = 0;
-#endif
     mount->exfat.commit_attempted = 0;
     mount->exfat.commit_ready = 0;
     mount->exfat.commit_write_count = 0;
     mount->exfat.commit_verified = 0;
+    mount->exfat.write_whitelisted = 0;
     for (uint64_t i = 0; i < EXFAT_ALLOC_PLAN_CLUSTER_COUNT; i++) {
         mount->exfat.transaction_fat_offsets[i] = 0;
         mount->exfat.transaction_fat_old_values[i] = 0;
@@ -1031,6 +1060,54 @@ static int exfat_patched_directory_name_matches(const uint8_t *name_entry) {
     }
 
     return 1;
+}
+
+static int exfat_usb_test_media_whitelisted(struct blockfs_mount *mount) {
+    return mount != 0 &&
+           mount->exfat.present &&
+           mount->block.writable &&
+           chars_equal(mount->source, "usb0p1") &&
+           mount->block.block_size == 512 &&
+           mount->block.block_count == 22528 &&
+           mount->exfat.partition_offset == 2048 &&
+           mount->exfat.volume_length == 22528 &&
+           mount->exfat.fat_offset == 128 &&
+           mount->exfat.fat_length == 64 &&
+           mount->exfat.cluster_heap_offset == 192 &&
+           mount->exfat.cluster_count == 1024 &&
+           mount->exfat.root_dir_cluster == 2 &&
+           mount->exfat.volume_serial == 0x54425355U &&
+           mount->exfat.allocation_bitmap_present &&
+           mount->exfat.allocation_plan_ready &&
+           mount->exfat.create_plan_ready &&
+           mount->exfat.transaction_plan_ready &&
+           mount->exfat.patched_transaction_ready;
+}
+
+static int exfat_write_commit_allowed(struct blockfs_mount *mount) {
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    return mount != 0 && mount->exfat.present && mount->block.writable;
+#else
+    return exfat_usb_test_media_whitelisted(mount);
+#endif
+}
+
+static const char *exfat_write_policy_string(struct blockfs_mount *mount) {
+    if (mount == 0 || !mount->exfat.present) {
+        return "not_exfat";
+    }
+    if (!mount->block.writable) {
+        return "readonly_block_device";
+    }
+    if (mount->exfat.commit_ready && mount->exfat.write_whitelisted) {
+        return "writable_test_usb";
+    }
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    if (mount->exfat.commit_ready) {
+        return "writable_test_build";
+    }
+#endif
+    return "readonly_non_test_media";
 }
 
 static int apply_exfat_create_transaction_to_sectors(struct blockfs_mount *mount,
@@ -1153,12 +1230,16 @@ static void dry_run_exfat_create_transaction(struct blockfs_mount *mount) {
 }
 
 static void commit_exfat_create_transaction_for_test(struct blockfs_mount *mount) {
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
     struct exfat_sector_transaction tx;
     uint8_t *bitmap_sector;
     uint8_t *fat_sector;
     uint8_t *directory_sector;
 
+    if (!exfat_write_commit_allowed(mount)) {
+        return;
+    }
+    mount->exfat.commit_supported = 1;
+    mount->exfat.write_whitelisted = exfat_usb_test_media_whitelisted(mount);
     mount->exfat.commit_attempted = 1;
     exfat_sector_transaction_begin_for_test(&tx, mount);
     bitmap_sector = exfat_sector_transaction_get_for_test(&tx,
@@ -1206,12 +1287,8 @@ static void commit_exfat_create_transaction_for_test(struct blockfs_mount *mount
              mount->exfat.patched_bitmap_value,
              mount->exfat.patched_fat_values[0],
              mount->exfat.patched_fat_values[1]);
-#else
-    (void)mount;
-#endif
 }
 
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 static struct exfat_root_entry *find_exfat_test_file_entry(struct blockfs_mount *mount) {
     if (mount == 0) {
         return 0;
@@ -1644,6 +1721,7 @@ static int find_exfat_root_directory_slot_for_test(struct blockfs_mount *mount,
         }
 
         for (uint64_t sector_index = 0; sector_index < sectors_per_cluster; sector_index++) {
+            run = 0;
             if (block_read(mount->block_index, lba + sector_index, 1, sector) != 0) {
                 return -1;
             }
@@ -1683,14 +1761,37 @@ static int create_exfat_test_file_with_clusters_for_test(struct blockfs_mount *m
     uint64_t capacity;
     struct exfat_root_entry *entry;
 
-    if (mount == 0 || path == 0 || !mount->exfat.commit_ready ||
-        requested_clusters == 0 ||
-        requested_clusters > EXFAT_ALLOC_PLAN_CLUSTER_COUNT ||
-        parse_exfat_test_short_name(path, name, sizeof(name)) != 0 ||
-        find_exfat_root_entry(mount, path) != 0 ||
-        find_exfat_free_cluster_run_for_test(mount, clusters, requested_clusters) != 0 ||
-        find_exfat_root_directory_slot_for_test(mount, &dir_lba, &dir_offset) != 0 ||
-        dir_offset + EXFAT_CREATE_PLAN_ENTRY_BYTES > 512) {
+    if (mount == 0 || path == 0 || !mount->exfat.commit_ready) {
+        log_warn("exFAT test create rejected: unavailable path=%s\n",
+                 path == 0 ? "(null)" : path);
+        return -1;
+    }
+    if (requested_clusters == 0 ||
+        requested_clusters > EXFAT_ALLOC_PLAN_CLUSTER_COUNT) {
+        log_warn("exFAT test create rejected: clusters path=%s requested=%u\n",
+                 path, requested_clusters);
+        return -1;
+    }
+    if (parse_exfat_test_short_name(path, name, sizeof(name)) != 0) {
+        log_warn("exFAT test create rejected: name path=%s\n", path);
+        return -1;
+    }
+    if (find_exfat_root_entry(mount, path) != 0) {
+        log_warn("exFAT test create rejected: exists path=%s\n", path);
+        return -1;
+    }
+    if (find_exfat_free_cluster_run_for_test(mount, clusters, requested_clusters) != 0) {
+        log_warn("exFAT test create rejected: no cluster run path=%s requested=%u\n",
+                 path, requested_clusters);
+        return -1;
+    }
+    if (find_exfat_root_directory_slot_for_test(mount, &dir_lba, &dir_offset) != 0) {
+        log_warn("exFAT test create rejected: no directory slot path=%s\n", path);
+        return -1;
+    }
+    if (dir_offset + EXFAT_CREATE_PLAN_ENTRY_BYTES > 512) {
+        log_warn("exFAT test create rejected: directory slot crosses sector path=%s off=%u\n",
+                 path, dir_offset);
         return -1;
     }
 
@@ -1941,7 +2042,91 @@ static int unlink_exfat_test_file_for_test(struct blockfs_mount *mount, const ch
     clear_exfat_root_entry(entry);
     return 0;
 }
-#endif
+
+static uint64_t exfat_managed_entry_capacity_for_test(struct blockfs_mount *mount,
+                                                      struct exfat_root_entry *entry) {
+    uint64_t sectors_per_cluster = mount == 0
+        ? 0
+        : one_shifted_by(mount->exfat.sectors_per_cluster_shift);
+    uint64_t cluster_size = sectors_per_cluster * 512;
+    uint64_t cluster_count = 0;
+    uint32_t cluster;
+
+    if (mount == 0 || entry == 0 ||
+        (entry->stream_flags & 0x02) != 0 ||
+        !exfat_cluster_valid(mount, entry->first_cluster) ||
+        cluster_size == 0) {
+        return 0;
+    }
+
+    cluster = entry->first_cluster;
+    for (uint64_t i = 0; i < EXFAT_ALLOC_PLAN_CLUSTER_COUNT; i++) {
+        uint32_t next = 0xffffffffU;
+
+        if (exfat_read_fat_entry(mount, cluster, &next) != 0) {
+            return 0;
+        }
+        cluster_count++;
+        if (next >= 0xfffffff8U) {
+            uint64_t capacity = cluster_count * cluster_size;
+            return entry->size <= capacity ? capacity : 0;
+        }
+        if (!exfat_cluster_valid(mount, next)) {
+            return 0;
+        }
+        cluster = next;
+    }
+
+    return 0;
+}
+
+static int exfat_root_file_name_managed_for_test(struct exfat_root_entry *entry) {
+    char path[VFS_MOUNT_PATH_MAX];
+    uint64_t len;
+
+    if (entry == 0 || !chars_equal(entry->parent, "/")) {
+        return 0;
+    }
+
+    len = cstr_length(entry->name);
+    if (len == 0 || len + 2 > sizeof(path)) {
+        return 0;
+    }
+    path[0] = '/';
+    for (uint64_t i = 0; i < len; i++) {
+        path[i + 1] = entry->name[i];
+    }
+    path[len + 1] = '\0';
+
+    return parse_exfat_test_short_name(path, path, sizeof(path)) == 0;
+}
+
+static void mark_exfat_writable_root_entries_for_test(struct blockfs_mount *mount) {
+    if (mount == 0 || !mount->exfat.commit_ready) {
+        return;
+    }
+
+    for (uint64_t i = 0; i < mount->root_entry_count; i++) {
+        struct exfat_root_entry *entry = &mount->root_entries[i];
+        uint64_t capacity;
+
+        if (entry->name[0] == '\0' ||
+            entry->is_dir ||
+            !chars_equal(entry->parent, "/") ||
+            !exfat_root_file_name_managed_for_test(entry) ||
+            entry->directory_lba == 0 ||
+            entry->directory_byte_offset + EXFAT_CREATE_PLAN_ENTRY_BYTES > 512) {
+            continue;
+        }
+
+        capacity = exfat_managed_entry_capacity_for_test(mount, entry);
+        if (capacity == 0) {
+            continue;
+        }
+        entry->capacity = capacity;
+        entry->writable = 1;
+    }
+}
 
 static void plan_exfat_create_transaction(struct blockfs_mount *mount) {
     uint8_t sector[512];
@@ -2039,6 +2224,7 @@ static void plan_exfat_create_transaction(struct blockfs_mount *mount) {
 
     dry_run_exfat_create_transaction(mount);
     commit_exfat_create_transaction_for_test(mount);
+    mark_exfat_writable_root_entries_for_test(mount);
 }
 
 static void reset_exfat_create_plan(struct blockfs_mount *mount) {
@@ -2088,6 +2274,7 @@ static void plan_exfat_root_directory_create(struct blockfs_mount *mount) {
         }
 
         for (uint64_t sector_index = 0; sector_index < sectors_per_cluster; sector_index++) {
+            run = 0;
             if (block_read(mount->block_index, lba + sector_index, 1, sector) != 0) {
                 return;
             }
@@ -2153,7 +2340,8 @@ static void parse_exfat_directory_chain(struct blockfs_mount *mount, const char 
             if (block_read(mount->block_index, lba + sector_index, 1, sector) != 0) {
                 return;
             }
-            if (parse_exfat_directory_sector(mount, sector, parent, &stop) != 0) {
+            if (parse_exfat_directory_sector(mount, sector, parent, lba + sector_index,
+                                             &stop) != 0) {
                 return;
             }
         }
@@ -2441,6 +2629,8 @@ static void append_exfat_transaction_plan(struct blockfs_mount *mount,
     append_u64(buffer, buffer_len, pos, mount->exfat.commit_write_count);
     append_string(buffer, buffer_len, pos, "\ncommit_verified: ");
     append_u64(buffer, buffer_len, pos, mount->exfat.commit_verified);
+    append_string(buffer, buffer_len, pos, "\nwrite_whitelisted: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.write_whitelisted);
 }
 
 static void parse_exfat_root_directory(struct blockfs_mount *mount) {
@@ -2796,6 +2986,10 @@ static uint64_t build_info(struct blockfs_mount *mount, char *buffer, uint64_t b
         append_u64(buffer, buffer_len, &pos, mount->exfat.number_of_fats);
         append_string(buffer, buffer_len, &pos, "\npercent_in_use: ");
         append_u64(buffer, buffer_len, &pos, mount->exfat.percent_in_use);
+        append_string(buffer, buffer_len, &pos, "\nwrite_enabled: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.commit_ready);
+        append_string(buffer, buffer_len, &pos, "\nwrite_policy: ");
+        append_string(buffer, buffer_len, &pos, exfat_write_policy_string(mount));
         append_string(buffer, buffer_len, &pos, "\nallocation_bitmap: ");
         append_string(buffer, buffer_len, &pos,
                       mount->exfat.allocation_bitmap_present ? "present" : "missing");
@@ -2904,8 +3098,8 @@ static struct exfat_root_entry *find_exfat_root_entry(struct blockfs_mount *moun
     }
 
     for (uint64_t i = 0; i < mount->root_entry_count; i++) {
-        if (chars_equal(parent, mount->root_entries[i].parent) &&
-            chars_equal(name, mount->root_entries[i].name)) {
+        if (mount_path_equal(mount, parent, mount->root_entries[i].parent) &&
+            mount_path_equal(mount, name, mount->root_entries[i].name)) {
             return &mount->root_entries[i];
         }
     }
@@ -3071,7 +3265,7 @@ static int blockfs_list(const char *path, uint64_t index, struct vfs_dirent *out
 
     for (uint64_t i = 0; i < mount->root_entry_count; i++) {
         struct exfat_root_entry *entry = &mount->root_entries[i];
-        if (!chars_equal(entry->parent, path)) {
+        if (!mount_path_equal(mount, entry->parent, path)) {
             continue;
         }
         if (local_index != index) {
@@ -3106,7 +3300,6 @@ static uint64_t blockfs_size(const char *path, void *context) {
     return (uint64_t)-1;
 }
 
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 static uint64_t blockfs_write_new_file_for_test(struct blockfs_mount *mount,
                                                 struct exfat_root_entry *entry,
                                                 uint64_t offset,
@@ -3246,7 +3439,6 @@ static int blockfs_unlink(const char *path, void *context) {
 
     return unlink_exfat_test_file_for_test(mount, path);
 }
-#endif
 
 int blockfs_mount(uint64_t block_index, const char *mount_path) {
     struct blockfs_mount *mount = 0;
@@ -3305,13 +3497,11 @@ int blockfs_mount(uint64_t block_index, const char *mount_path) {
         }
     }
 
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
-    if (mount->exfat.present) {
+    if (mount->exfat.present && mount->exfat.commit_ready) {
         write = blockfs_write;
         truncate = blockfs_truncate;
         unlink = blockfs_unlink;
     }
-#endif
 
     if (vfs_register_fs_mount("blkfs", mount_path, mount->source,
                               blockfs_read, blockfs_list, write,

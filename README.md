@@ -20,8 +20,9 @@ programs.
 - Provides a block-device layer with in-memory `ramblk0`, QEMU virtio-blk
   `vd0`, MBR primary partition devices such as `vd0p1` and `vd0p2`, an exFAT
   test mount at `/usb` with guarded write-path validation builds, a USB
-  Mass Storage exFAT test mount at `/usbdisk` in QEMU, and readonly FAT32
-  boot-partition samples mounted at `/boot` and `/usbboot`.
+  Mass Storage exFAT test mount at `/usbdisk` in QEMU with whitelisted
+  uppercase 8.3 root-file writes, and readonly FAT32 boot-partition samples
+  mounted at `/boot` and `/usbboot`.
 - Includes an interactive shell plus standalone `/bin/hello.elf`,
   `/bin/ls.elf`, and `/bin/cat.elf` user programs.
 

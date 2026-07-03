@@ -176,25 +176,39 @@ write_at($fh, lba_offset($fat32_start + 1), $fsinfo);
 my $fat = "\0" x (16 * $sector_size);
 substr($fat, 0, 4, le32(0x0ffffff8));
 substr($fat, 4, 4, le32(0xffffffff));
-substr($fat, 8, 4, le32(0x0fffffff));
+substr($fat, 8, 4, le32(9));
 substr($fat, 12, 4, le32(0x0fffffff));
 substr($fat, 16, 4, le32(0x0fffffff));
 substr($fat, 20, 4, le32(0x0fffffff));
 substr($fat, 24, 4, le32(0x0fffffff));
 substr($fat, 28, 4, le32(0x0fffffff));
 substr($fat, 32, 4, le32(0x0fffffff));
+substr($fat, 36, 4, le32(0x0fffffff));
+substr($fat, 40, 4, le32(11));
+substr($fat, 44, 4, le32(0x0fffffff));
+substr($fat, 48, 4, le32(0x0fffffff));
 write_at($fh, lba_offset($fat32_start + 32), $fat);
 
 my $readme = "Hello from FAT32 boot partition.\n";
 my $kernel = "This FAT32 sample stands in for a UEFI ESP.\n";
 my $bootx64 = "TangPingOS can now walk FAT32 EFI/BOOT.\n";
 my $long_name = "FAT32 multi-entry long file names are visible now.\n";
+my $chain_content =
+    "FAT32 chained file cluster 10 begins here.\n" .
+    ("A" x 470) .
+    "FAT32 chained file cluster 11 continues here.\n" .
+    ("B" x 180) .
+    "FAT32 chained file end.\n";
+my $late = "FAT32 late root entry from the second directory cluster.\n";
 my $root = "\0" x $sector_size;
 substr($root, 0, 32, short_entry("README  TXT", 0x20, 3, length($readme)));
 substr($root, 32, 32, short_entry("KERNEL  TXT", 0x20, 4, length($kernel)));
 substr($root, 64, 32, short_entry("EFI        ", 0x10, 5, 0));
 substr($root, 96, 64, lfn_entries("very long filename.txt", "VERYLO~1TXT"));
 substr($root, 160, 32, short_entry("VERYLO~1TXT", 0x20, 8, length($long_name)));
+substr($root, 192, 32, short_entry("CHAIN   TXT", 0x20, 10, length($chain_content)));
+my $root_late = "\0" x $sector_size;
+substr($root_late, 0, 32, short_entry("LATE    TXT", 0x20, 12, length($late)));
 my $efi_dir = "\0" x $sector_size;
 substr($efi_dir, 0, 32, short_entry("BOOT       ", 0x10, 6, 0));
 my $boot_dir = "\0" x $sector_size;
@@ -206,5 +220,9 @@ write_at($fh, lba_offset($fat32_start + 51), $efi_dir);
 write_at($fh, lba_offset($fat32_start + 52), $boot_dir);
 write_at($fh, lba_offset($fat32_start + 53), $bootx64);
 write_at($fh, lba_offset($fat32_start + 54), $long_name);
+write_at($fh, lba_offset($fat32_start + 55), $root_late);
+write_at($fh, lba_offset($fat32_start + 56), substr($chain_content, 0, 512));
+write_at($fh, lba_offset($fat32_start + 57), substr($chain_content, 512));
+write_at($fh, lba_offset($fat32_start + 58), $late);
 
 close $fh or die "close $out: $!\n";

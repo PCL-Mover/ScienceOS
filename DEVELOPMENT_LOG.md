@@ -95,3 +95,6 @@
 - 2026-06-26: 新增 xHCI Mass Storage 动态 transfer/event ring 回绕状态机，并用 USB scratch 写读压力自测覆盖 event、bulk-in、bulk-out 回绕。
 - 2026-06-27: 扩展 xHCI root port 扫描，记录并通过 `usb` 命令显示第二个连接端口，为识别 QEMU `usb-kbd` 做准备。
 - 2026-06-27: 为 QEMU USB 测试盘新增第二个 FAT32 分区并挂载为 `/usbboot`，验证 FAT32 可通过 USB Mass Storage 只读访问。
+- 2026-07-02: 扩展 FAT32 测试镜像与启动自检，验证 `/boot` 和 `/usbboot` 可读取跨 cluster 文件与第二 root 目录 cluster 条目。
+- 2026-07-02: 为 FAT32 挂载增加 ASCII 大小写不敏感路径查找，`/boot/readme.txt` 和 `/usbboot/readme.txt` 可匹配大写目录项。
+- 2026-07-03: 将白名单 QEMU USB exFAT 挂载 `/usbdisk` 开放为普通用户态可写，并验证写入、追加、复制、删除、扩容和重启持久化读取。
