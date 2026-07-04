@@ -211,6 +211,30 @@ int vfs_mount_info(uint64_t index, struct vfs_mount_info *out) {
     return 0;
 }
 
+int vfs_update_mount_write_handlers(void *context, vfs_write_fn write,
+                                    vfs_truncate_fn truncate,
+                                    vfs_unlink_fn unlink) {
+    if (context == 0 || write == 0) {
+        return -1;
+    }
+
+    for (uint64_t i = 0; i < filesystem_count; i++) {
+        struct vfs_filesystem *fs = &filesystems[i];
+        if (fs->context != context) {
+            continue;
+        }
+        fs->write = write;
+        fs->truncate = truncate;
+        fs->unlink = unlink;
+        fs->writable = 1;
+        log_info("VFS mount write handlers enabled: %s at %s source=%s\n",
+                 fs->name, fs->path, fs->source);
+        return 0;
+    }
+
+    return -1;
+}
+
 int vfs_file_exists(const char *path) {
     uint8_t dummy;
 

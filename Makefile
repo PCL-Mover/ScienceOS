@@ -12,6 +12,7 @@ INITRD := $(BUILD_DIR)/initrd.tar
 ISO := $(BUILD_DIR)/TangPingOS.iso
 DISK := $(BUILD_DIR)/disk.img
 USB_DISK := $(BUILD_DIR)/usb.img
+USB_GPT_DISK := $(BUILD_DIR)/usb-gpt.img
 
 BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
 LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
@@ -128,7 +129,7 @@ CAT_OBJECTS := $(patsubst userspace/%.c,$(BUILD_DIR)/userspace/%.o,$(CAT_SOURCES
 INITRD_FILES := $(shell find initrd -type f 2>/dev/null)
 INITRD_PACKED_PATHS := $(patsubst initrd/%,%,$(INITRD_FILES)) bin/shell.elf bin/hello.elf bin/ls.elf bin/cat.elf
 
-.PHONY: all kernel init shell hello ls cat initrd iso disk usb-disk run test-exception test-page-fault test-user-fault test-user-programs test-exfat-commit clean check-tools check-uefi
+.PHONY: all kernel init shell hello ls cat initrd iso disk usb-disk usb-gpt-disk run test-exception test-page-fault test-user-fault test-user-programs test-exfat-commit clean check-tools check-uefi
 
 all: iso
 
@@ -151,6 +152,8 @@ iso: check-tools $(ISO)
 disk: $(DISK)
 
 usb-disk: $(USB_DISK)
+
+usb-gpt-disk: $(USB_GPT_DISK)
 
 run: iso disk usb-disk check-uefi
 	$(QEMU) \
@@ -264,8 +267,11 @@ $(BUILD_DIR):
 $(DISK): | $(BUILD_DIR)
 	perl scripts/make_test_disk.pl $@
 
-$(USB_DISK): | $(BUILD_DIR)
+$(BUILD_DIR)/usb.img: | $(BUILD_DIR)
 	perl scripts/make_usb_disk.pl $@
+
+$(BUILD_DIR)/usb-gpt.img: | $(BUILD_DIR)
+	perl scripts/make_usb_disk.pl --gpt $@
 
 check-tools:
 	@command -v $(CC) >/dev/null || { echo "Missing clang. Install with: brew install llvm"; exit 1; }

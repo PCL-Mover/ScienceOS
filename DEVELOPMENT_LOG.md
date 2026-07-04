@@ -98,3 +98,27 @@
 - 2026-07-02: 扩展 FAT32 测试镜像与启动自检，验证 `/boot` 和 `/usbboot` 可读取跨 cluster 文件与第二 root 目录 cluster 条目。
 - 2026-07-02: 为 FAT32 挂载增加 ASCII 大小写不敏感路径查找，`/boot/readme.txt` 和 `/usbboot/readme.txt` 可匹配大写目录项。
 - 2026-07-03: 将白名单 QEMU USB exFAT 挂载 `/usbdisk` 开放为普通用户态可写，并验证写入、追加、复制、删除、扩容和重启持久化读取。
+- 2026-07-03: 为非 QEMU xHCI USB 探测加入 handoff/reset/start 状态观测，并让真实或未知 USB Mass Storage 默认只读挂载。
+- 2026-07-03: 新增基础 GPT 分区表扫描，并按实际 exFAT/FAT32 类型选择 USB 只读挂载目标。
+- 2026-07-03: 在 exFAT `/info.txt` 中加入写入候选审计字段，区分元数据可写准备状态与实际写入策略开关。
+- 2026-07-03: 扩展 exFAT 写入风险报告，显示 dirty/media flags、主备 boot sector checksum 与真实介质写入前置阻塞原因。
+- 2026-07-03: 为 QEMU exFAT 测试镜像生成有效主备 boot region 与 checksum sector，使真实介质写入前置审计可在测试盘上通过。
+- 2026-07-03: 在 exFAT `/info.txt` 增加真实介质写入 dry-run 报告，列出候选根文件创建事务会触及的 LBA、cluster 和策略门禁状态。
+- 2026-07-03: 新增 shell `writeaudit` 命令，汇总 `/usbdisk` 写入策略、阻塞原因和 dry-run 事务范围，作为真实 U 盘手动解锁前的审计入口。
+- 2026-07-03: 新增受控 `writeunlock` 命令和 blockfs 解锁 syscall，只有 dry-run LBA 与真实 USB exFAT 前置检查匹配时才打开手动写入路径。
+- 2026-07-04: 为真机 xHCI root port 扫描增加 selected port 打分选择和 shell 诊断，避免只重置第一个连接端口。
+- 2026-07-04: 新增 `usbdiag` 精简排障命令，用 reason/hint 汇总 xHCI root port、address、BOT 与 usb0 注册状态。
+- 2026-07-04: 为真机 xHCI root ports 增加显式上电和 bounded rescan，并在 `usbdiag` 中显示 power/rescan 计数。
+- 2026-07-04: 新增第一层 USB hub 配置、描述符读取、下游端口供电/复位诊断，为后续枚举 hub 后的 U 盘做准备。
+- 2026-07-04: 将 EP0 控制传输完成事件改为按 status TRB 地址匹配，减少真机 hub `SET_CONFIGURATION` 对固定 event index 的依赖。
+- 2026-07-04: 将 hub descriptor 探测改为读取最小 7 字节头部，并在 USB2 hub 描述符失败时回退尝试 SuperSpeed hub 描述符。
+- 2026-07-04: 允许 EP0 control read 匹配 data TRB 的 short-packet 完成事件，以兼容真机 hub descriptor 读取路径。
+- 2026-07-04: 为第一层 USB hub 的 interrupt IN endpoint 建立 xHCI endpoint context，再执行 hub set configuration。
+- 2026-07-04: 按 xHCI 周期端点规则补全 hub interrupt IN endpoint 的 interval、burst、ESIT payload 与平均 TRB 长度。
+- 2026-07-04: 将 xHCI Enable Slot、Address Device 和 Configure Endpoint 改为统一 command ring 提交并按命令 TRB 指针匹配完成事件。
+- 2026-07-04: 为第一层 USB hub 下游端口 reset 增加 change feature 清理和更长 bounded poll，推动 hub 后 U 盘进入 enabled 状态。
+- 2026-07-04: 将 EP0 控制传输改为维护 producer/cycle 的 transfer ring 提交，避免 hub class request 依赖固定 TRB 下标。
+- 2026-07-04: 在 hub 下游端口 reset 成功后启用第二个 xHCI slot，并用 route string 枚举 hub 后的 Mass Storage 设备。
+- 2026-07-04: 将 Mass Storage 初始 INQUIRY/READ CAPACITY/READ10 切换为动态 bulk ring 提交并按 TRB 指针匹配完成事件。
+- 2026-07-04: xHCI 启动探测改为遍历所有已连接 root port，避免只尝试 hub 或单个端口而漏掉直插启动 U 盘。
+- 2026-07-04: 重排 USB Mass Storage 初始化顺序，先执行 SET_CONFIGURATION，再配置 bulk endpoint，并加入 BOT reset、clear-halt 与 INQUIRY 重试。

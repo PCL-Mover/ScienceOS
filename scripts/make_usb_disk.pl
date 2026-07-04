@@ -2,7 +2,12 @@
 use strict;
 use warnings;
 
-my $out = shift @ARGV or die "usage: make_usb_disk.pl OUTPUT\n";
+my $layout = "mbr";
+if (@ARGV && $ARGV[0] eq "--gpt") {
+    $layout = "gpt";
+    shift @ARGV;
+}
+my $out = shift @ARGV or die "usage: make_usb_disk.pl [--gpt] OUTPUT\n";
 my $sector_size = 512;
 my $sectors_per_cluster = 8;
 my $cluster_size = $sector_size * $sectors_per_cluster;
@@ -24,6 +29,108 @@ sub write_at {
     print {$fh} $data;
 }
 sub lba_offset { return ($_[0] * $sector_size); }
+sub exfat_boot_checksum_step {
+    my ($checksum, $byte) = @_;
+    return (((($checksum & 1) != 0) ? 0x80000000 : 0) +
+            (($checksum >> 1) & 0x7fffffff) +
+            $byte) & 0xffffffff;
+}
+sub exfat_boot_checksum {
+    my ($region) = @_;
+    my $checksum = 0;
+    for my $i (0 .. (11 * $sector_size) - 1) {
+        next if $i == 106 || $i == 107 || $i == 112;
+        $checksum = exfat_boot_checksum_step($checksum, ord(substr($region, $i, 1)));
+    }
+    return $checksum;
+}
+sub exfat_checksum_sector {
+    my ($checksum) = @_;
+    return le32($checksum) x int($sector_size / 4);
+}
+sub exfat_boot_region {
+    my ($boot_sector) = @_;
+    my $region = $boot_sector . ("\0" x (10 * $sector_size)) . ("\0" x $sector_size);
+    for my $sector (1 .. 8) {
+        substr($region, $sector * $sector_size + 508, 4, "\0\0\x55\xaa");
+    }
+    my $checksum = exfat_boot_checksum($region);
+    substr($region, 11 * $sector_size, $sector_size, exfat_checksum_sector($checksum));
+    return $region;
+}
+sub utf16le_name {
+    my ($name) = @_;
+    my $out = "";
+    my @chars = split(//, $name);
+    for my $i (0 .. 35) {
+        my $ch = $i <= $#chars ? ord($chars[$i]) : 0;
+        $out .= le16($ch);
+    }
+    return $out;
+}
+sub guid_bytes {
+    my ($d1, $d2, $d3, @rest) = @_;
+    return le32($d1) . le16($d2) . le16($d3) . pack("C*", @rest);
+}
+sub gpt_entry {
+    my ($type_guid, $unique_guid, $first_lba, $last_lba, $name) = @_;
+    my $entry = $type_guid . $unique_guid . le64($first_lba) . le64($last_lba) .
+                le64(0) . utf16le_name($name);
+    return substr($entry . ("\0" x 128), 0, 128);
+}
+sub write_mbr_partition_table {
+    my ($fh) = @_;
+    my $mbr = "\0" x $sector_size;
+    substr($mbr, 446, 16,
+           "\0\0\0\0" . chr(0x07) . "\0\0\0" . le32($exfat_start) . le32($exfat_sectors));
+    substr($mbr, 462, 16,
+           "\0\0\0\0" . chr(0x0c) . "\0\0\0" . le32($fat32_start) . le32($fat32_sectors));
+    substr($mbr, 510, 2, "\x55\xaa");
+    write_at($fh, 0, $mbr);
+}
+sub write_gpt_partition_table {
+    my ($fh) = @_;
+    my $mbr = "\0" x $sector_size;
+    my $protective_count = $disk_sectors - 1;
+    substr($mbr, 446, 16,
+           "\0\0\0\0" . chr(0xee) . "\0\0\0" . le32(1) . le32($protective_count));
+    substr($mbr, 510, 2, "\x55\xaa");
+    write_at($fh, 0, $mbr);
+
+    my $basic_data = guid_bytes(0xebd0a0a2, 0xb9e5, 0x4433,
+                                0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7);
+    my $efi_system = guid_bytes(0xc12a7328, 0xf81f, 0x11d2,
+                                0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b);
+    my $entries = "\0" x ($sector_size * 32);
+    substr($entries, 0, 128,
+           gpt_entry($basic_data,
+                     guid_bytes(0x11111111, 0x2222, 0x3333,
+                                0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb),
+                     $exfat_start, $fat32_start - 1, "TangPingOS exFAT"));
+    substr($entries, 128, 128,
+           gpt_entry($efi_system,
+                     guid_bytes(0x22222222, 0x3333, 0x4444,
+                                0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc),
+                     $fat32_start, $fat32_start + $fat32_sectors - 1,
+                     "TangPingOS FAT32"));
+    write_at($fh, lba_offset(2), $entries);
+
+    my $header = "\0" x $sector_size;
+    substr($header, 0, 8, "EFI PART");
+    substr($header, 8, 4, le32(0x00010000));
+    substr($header, 12, 4, le32(92));
+    substr($header, 24, 8, le64(1));
+    substr($header, 32, 8, le64($disk_sectors - 1));
+    substr($header, 40, 8, le64(34));
+    substr($header, 48, 8, le64($disk_sectors - 34));
+    substr($header, 56, 16,
+           guid_bytes(0x33333333, 0x4444, 0x5555,
+                      0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd));
+    substr($header, 72, 8, le64(2));
+    substr($header, 80, 4, le32(128));
+    substr($header, 84, 4, le32(128));
+    write_at($fh, lba_offset(1), $header);
+}
 sub exfat_name_entry {
     my ($name) = @_;
     my $entry = "\xc1\0";
@@ -91,13 +198,11 @@ sub lfn_entries {
 open my $fh, ">:raw", $out or die "open $out: $!\n";
 print {$fh} "\0" x ($disk_sectors * $sector_size);
 
-my $mbr = "\0" x $sector_size;
-substr($mbr, 446, 16,
-       "\0\0\0\0" . chr(0x07) . "\0\0\0" . le32($exfat_start) . le32($exfat_sectors));
-substr($mbr, 462, 16,
-       "\0\0\0\0" . chr(0x0c) . "\0\0\0" . le32($fat32_start) . le32($fat32_sectors));
-substr($mbr, 510, 2, "\x55\xaa");
-write_at($fh, 0, $mbr);
+if ($layout eq "gpt") {
+    write_gpt_partition_table($fh);
+} else {
+    write_mbr_partition_table($fh);
+}
 
 my $exfat = "\0" x $sector_size;
 substr($exfat, 0, 11, "\xeb\x76\x90" . "EXFAT   ");
@@ -112,7 +217,9 @@ substr($exfat, 100, 4, "USBT");
 substr($exfat, 104, 2, le16(0x0100));
 substr($exfat, 108, 5, "\x09\x03\x01\x80\x00");
 substr($exfat, 510, 2, "\x55\xaa");
-write_at($fh, lba_offset($exfat_start), $exfat);
+my $exfat_boot_region = exfat_boot_region($exfat);
+write_at($fh, lba_offset($exfat_start), $exfat_boot_region);
+write_at($fh, lba_offset($exfat_start + 12), $exfat_boot_region);
 
 my $exfat_base = lba_offset($exfat_start);
 write_at($fh, $exfat_base + 128 * $sector_size + 8, le32(8));

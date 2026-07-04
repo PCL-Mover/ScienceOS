@@ -135,6 +135,14 @@ uint64_t tpos_mount_info(uint64_t index, struct mount_info *info) {
     return tpos_syscall3(SYS_MOUNT_INFO, index, (uint64_t)info, sizeof(*info));
 }
 
+uint64_t tpos_blockfs_unlock(const char *mount_path,
+                             const struct blockfs_unlock_request *request) {
+    return tpos_syscall3(SYS_BLOCKFS_UNLOCK,
+                         (uint64_t)mount_path,
+                         (uint64_t)request,
+                         sizeof(*request));
+}
+
 __attribute__((noreturn))
 void tpos_exit(uint64_t status) {
     tpos_syscall2(SYS_EXIT, status, 0);

@@ -49,6 +49,83 @@ static volatile uint64_t requests_start_marker[4] = LIMINE_REQUESTS_START_MARKER
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end_marker[2] = LIMINE_REQUESTS_END_MARKER;
 
+static void copy_cstr_limited(char *dst, uint64_t dst_len, const char *src) {
+    uint64_t i = 0;
+
+    if (dst_len == 0) {
+        return;
+    }
+    while (src[i] != '\0' && i + 1 < dst_len) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static uint64_t string_length(const char *s) {
+    uint64_t len = 0;
+
+    while (s[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
+static void append_decimal_limited(char *out, uint64_t out_len, uint64_t value) {
+    char digits[20];
+    uint64_t len = string_length(out);
+    uint64_t count = 0;
+
+    do {
+        digits[count++] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value != 0 && count < sizeof(digits));
+
+    while (count > 0 && len + 1 < out_len) {
+        out[len++] = digits[--count];
+    }
+    if (len < out_len) {
+        out[len] = '\0';
+    }
+}
+
+static void make_usb_partition_name(char *out, uint64_t out_len, uint64_t number) {
+    copy_cstr_limited(out, out_len, "usb0p");
+    append_decimal_limited(out, out_len, number);
+}
+
+static void select_usb_blockfs_partitions(uint64_t *exfat_partition_index,
+                                          uint64_t *fat32_partition_index) {
+    if (exfat_partition_index == 0 || fat32_partition_index == 0) {
+        return;
+    }
+
+    for (uint64_t part = 1; part <= 16; part++) {
+        char name[32];
+        uint64_t index;
+        int fs_type;
+
+        make_usb_partition_name(name, sizeof(name), part);
+        if (block_find_by_name(name, &index) != 0) {
+            continue;
+        }
+
+        fs_type = blockfs_detect(index);
+        if (fs_type == BLOCKFS_DETECT_EXFAT &&
+            *exfat_partition_index == UINT64_MAX) {
+            *exfat_partition_index = index;
+        } else if (fs_type == BLOCKFS_DETECT_FAT32 &&
+                   *fat32_partition_index == UINT64_MAX) {
+            *fat32_partition_index = index;
+        }
+
+        if (*exfat_partition_index != UINT64_MAX &&
+            *fat32_partition_index != UINT64_MAX) {
+            return;
+        }
+    }
+}
+
 void _start(void) {
     console_init_serial();
     console_write("TangPingOS serial online\n");
@@ -120,12 +197,7 @@ void _start(void) {
     uint64_t usb_fat32_partition_index = UINT64_MAX;
     if (pci_register_usb_storage_block_device() == 0) {
         partition_scan_device(usb_block_index);
-        if (block_find_by_name("usb0p1", &usb_exfat_partition_index) != 0) {
-            usb_exfat_partition_index = UINT64_MAX;
-        }
-        if (block_find_by_name("usb0p2", &usb_fat32_partition_index) != 0) {
-            usb_fat32_partition_index = UINT64_MAX;
-        }
+        select_usb_blockfs_partitions(&usb_exfat_partition_index, &usb_fat32_partition_index);
     }
     vfs_init();
     devfs_init();

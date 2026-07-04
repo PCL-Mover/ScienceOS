@@ -27,6 +27,7 @@
 #define sys_block_read tpos_block_read
 #define sys_block_write tpos_block_write
 #define sys_mount_info tpos_mount_info
+#define sys_blockfs_unlock tpos_blockfs_unlock
 #define sys_sbrk tpos_sbrk
 #define sys_exit tpos_exit
 #define u64_to_decimal tpos_u64_to_decimal
@@ -1143,6 +1144,14 @@ static void cmd_usb(void) {
         write_u64_hex(info.xhci_op_pagesize);
         write_cstr("\nreset allowed: ");
         write_u64_decimal(info.xhci_reset_allowed);
+        write_cstr("\nreset_policy: ");
+        write_u64_decimal(info.xhci_reset_policy);
+        write_cstr("\nreal_hw_attempted: ");
+        write_u64_decimal(info.xhci_real_hw_attempted);
+        write_cstr("\nhandoff_required: ");
+        write_u64_decimal(info.xhci_handoff_required);
+        write_cstr("\ncontroller_start_result: ");
+        write_u64_decimal(info.xhci_controller_start_result);
         write_cstr("\nreset attempted: ");
         write_u64_decimal(info.xhci_reset_attempted);
         write_cstr("\nreset ok: ");
@@ -1231,6 +1240,12 @@ static void cmd_usb(void) {
         write_u64_decimal(info.xhci_port_scan_done);
         write_cstr("\nports scanned: ");
         write_u64_decimal(info.xhci_port_scan_limit);
+        write_cstr("\nport power attempted: ");
+        write_u64_decimal(info.xhci_port_power_attempted);
+        write_cstr("\nport power changed: ");
+        write_u64_decimal(info.xhci_port_power_changed_count);
+        write_cstr("\nport connect rescans: ");
+        write_u64_decimal(info.xhci_port_connect_rescan_count);
         write_cstr("\nconnected ports: ");
         write_u64_decimal(info.xhci_connected_port_count);
         write_cstr("\nenabled ports: ");
@@ -1261,6 +1276,20 @@ static void cmd_usb(void) {
         write_u64_decimal(info.xhci_second_connected_powered);
         write_cstr("\nsecond link state: ");
         write_u64_decimal(info.xhci_second_connected_link_state);
+        write_cstr("\nselected connected port: ");
+        write_u64_decimal(info.xhci_selected_connected_port);
+        write_cstr("\nselected portsc: ");
+        write_u64_hex(info.xhci_selected_connected_portsc);
+        write_cstr("\nselected speed: ");
+        write_u64_decimal(info.xhci_selected_connected_speed);
+        write_cstr("\nselected enabled: ");
+        write_u64_decimal(info.xhci_selected_connected_enabled);
+        write_cstr("\nselected powered: ");
+        write_u64_decimal(info.xhci_selected_connected_powered);
+        write_cstr("\nselected link state: ");
+        write_u64_decimal(info.xhci_selected_connected_link_state);
+        write_cstr("\nselected score: ");
+        write_u64_decimal(info.xhci_selected_connected_score);
         write_cstr("\nport1 portsc: ");
         write_u64_hex(info.xhci_port1_portsc);
         write_cstr("\nport reset attempted: ");
@@ -1533,6 +1562,10 @@ static void cmd_usb(void) {
         write_u64_decimal(info.xhci_bot_csw_residue);
         write_cstr("/");
         write_u64_decimal(info.xhci_bot_csw_status);
+        write_cstr("\nbot_last_error_stage: ");
+        write_u64_decimal(info.xhci_bot_last_error_stage);
+        write_cstr("\nusb_storage_readonly_policy: ");
+        write_u64_decimal(info.xhci_usb_storage_readonly_policy);
         write_cstr("\ninquiry peripheral/removable/version/format/addlen: ");
         write_u64_hex(info.xhci_inquiry_peripheral);
         write_cstr("/");
@@ -1718,6 +1751,195 @@ static void cmd_lsblk(void) {
     }
 }
 
+static int block_device_exists(const char *name) {
+    struct block_device_info info;
+
+    for (uint64_t i = 0; i < 16; i++) {
+        uint64_t result = sys_block_info(i, &info);
+        if (result == (uint64_t)-1) {
+            break;
+        }
+        if (strings_equal(info.name, name)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void cmd_usbdiag(void) {
+    static const char fail[] = "usbdiag: failed\n";
+    static struct system_info info;
+    int usb0_present;
+
+    if (sys_system_info(&info) != 0) {
+        write_literal(fail, sizeof(fail) - 1);
+        return;
+    }
+
+    usb0_present = block_device_exists("usb0");
+
+    write_cstr("xhci_found: ");
+    write_u64_decimal(info.xhci_found);
+    write_cstr("\ncontroller_started: ");
+    write_u64_decimal(info.xhci_controller_started);
+    write_cstr("\ncontroller_start_result: ");
+    write_u64_decimal(info.xhci_controller_start_result);
+    write_cstr("\nreset_policy: ");
+    write_u64_decimal(info.xhci_reset_policy);
+    write_cstr("\nroot_power_attempted/changed/rescans: ");
+    write_u64_decimal(info.xhci_port_power_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_port_power_changed_count);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_port_connect_rescan_count);
+    write_cstr("\nconnected_ports: ");
+    write_u64_decimal(info.xhci_connected_port_count);
+    write_cstr("\nselected_port/speed/score: ");
+    write_u64_decimal(info.xhci_selected_connected_port);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_selected_connected_speed);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_selected_connected_score);
+    write_cstr("\nport_reset_attempted/ok/port: ");
+    write_u64_decimal(info.xhci_port_reset_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_port_reset_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_port_reset_port);
+    write_cstr("\naddress_attempted/ok/cc: ");
+    write_u64_decimal(info.xhci_address_device_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_address_device_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_address_device_completion_code);
+    write_cstr("\ndevice_class/subclass/protocol: ");
+    write_u64_decimal(info.xhci_device_class);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_device_subclass);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_device_protocol);
+    write_cstr("\ninterface_class/subclass/protocol: ");
+    write_u64_decimal(info.xhci_first_interface_class);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_first_interface_subclass);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_first_interface_protocol);
+    write_cstr("\nconfigure endpoint attempted/ok/cc: ");
+    write_u64_decimal(info.xhci_configure_endpoint_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_configure_endpoint_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_configure_endpoint_completion_code);
+    write_cstr("\nhub detected/config/desc/ports: ");
+    write_u64_decimal(info.xhci_hub_detected);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_configuration_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_descriptor_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_port_count);
+    write_cstr("\nhub config attempted/cc: ");
+    write_u64_decimal(info.xhci_hub_configuration_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_configuration_completion_code);
+    write_cstr("\nhub desc cc/len/type: ");
+    write_u64_decimal(info.xhci_hub_descriptor_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_descriptor_length);
+    write_cstr("/");
+    write_u64_hex(info.xhci_hub_descriptor_type);
+    write_cstr("\nhub power_ok/status_port/reset_ok: ");
+    write_u64_decimal(info.xhci_hub_port_power_ok_count);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_first_connected_port);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_port_reset_ok);
+    write_cstr("\nhub port status/change: ");
+    write_u64_hex(info.xhci_hub_port_reset_status ?
+                  info.xhci_hub_port_reset_status :
+                  info.xhci_hub_first_port_status);
+    write_cstr("/");
+    write_u64_hex(info.xhci_hub_port_reset_change ?
+                  info.xhci_hub_port_reset_change :
+                  info.xhci_hub_first_port_change);
+    write_cstr("\nbot_inquiry/read_capacity/read10: ");
+    write_u64_decimal(info.xhci_bot_inquiry_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_capacity_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_read10_ok);
+    write_cstr("\nusb0_present: ");
+    write_u64_decimal(usb0_present);
+    write_cstr("\nreason: ");
+
+    if (!info.xhci_found) {
+        write_cstr("no_xhci_controller");
+    } else if (!info.xhci_mmio_mapped) {
+        write_cstr("xhci_mmio_not_mapped");
+    } else if (!info.xhci_reset_allowed) {
+        write_cstr("xhci_reset_blocked");
+    } else if (!info.xhci_controller_started) {
+        write_cstr("xhci_controller_not_started");
+    } else if (info.xhci_connected_port_count == 0 ||
+               info.xhci_selected_connected_port == 0) {
+        write_cstr("no_connected_root_port");
+    } else if (!info.xhci_port_reset_attempted) {
+        write_cstr("root_port_reset_not_attempted");
+    } else if (!info.xhci_port_reset_ok) {
+        write_cstr("root_port_reset_failed");
+    } else if (!info.xhci_address_device_attempted) {
+        write_cstr("address_device_not_attempted");
+    } else if (!info.xhci_address_device_ok) {
+        write_cstr("address_device_failed");
+    } else if ((info.xhci_device_class == 9 ||
+                info.xhci_first_interface_class == 9) &&
+               !info.xhci_hub_configuration_ok) {
+        write_cstr("usb_hub_configuration_failed");
+    } else if ((info.xhci_device_class == 9 ||
+                info.xhci_first_interface_class == 9) &&
+               !info.xhci_hub_descriptor_ok) {
+        write_cstr("usb_hub_descriptor_failed");
+    } else if ((info.xhci_device_class == 9 ||
+                info.xhci_first_interface_class == 9) &&
+               info.xhci_hub_first_connected_port == 0) {
+        write_cstr("usb_hub_no_downstream_device");
+    } else if ((info.xhci_device_class == 9 ||
+                info.xhci_first_interface_class == 9) &&
+               !info.xhci_hub_port_reset_ok) {
+        write_cstr("usb_hub_downstream_reset_failed");
+    } else if (info.xhci_device_class == 9 ||
+               info.xhci_first_interface_class == 9) {
+        write_cstr("usb_hub_downstream_reset_ok_second_slot_pending");
+    } else if (info.xhci_first_interface_seen &&
+               (info.xhci_first_interface_class != 8 ||
+                info.xhci_first_interface_subclass != 6 ||
+                info.xhci_first_interface_protocol != 80)) {
+        write_cstr("first_device_is_not_mass_storage_bot");
+    } else if (!info.xhci_bot_inquiry_ok) {
+        write_cstr("mass_storage_inquiry_failed_or_not_attempted");
+    } else if (!info.xhci_bot_capacity_ok) {
+        write_cstr("mass_storage_capacity_failed");
+    } else if (!usb0_present) {
+        write_cstr("mass_storage_ready_but_usb0_not_registered");
+    } else {
+        write_cstr("usb0_ready");
+    }
+    write_cstr("\nhint: ");
+    if (info.xhci_device_class == 9 || info.xhci_first_interface_class == 9) {
+        if (info.xhci_hub_port_reset_ok) {
+            write_cstr("Hub downstream reset works; next step is xHCI second-slot enumeration.");
+        } else {
+            write_cstr("Hub support is partial; capture these hub fields for the next driver step.");
+        }
+    } else if (!usb0_present) {
+        write_cstr("Try a directly attached USB mass-storage device, then capture usbdiag.");
+    } else {
+        write_cstr("Run lsblk and mounts.");
+    }
+    write_cstr("\n");
+}
+
 static void cmd_mounts(void) {
     static const char header[] = "id path fs source writable\n";
     struct mount_info info;
@@ -1739,6 +1961,227 @@ static void cmd_mounts(void) {
         write_literal(" ", 1);
         write_u64_decimal(info.writable);
         write_literal("\n", 1);
+    }
+}
+
+static int build_mount_info_path(const char *mount_path, char *out, uint64_t out_len) {
+    static const char info_name[] = "info.txt";
+    uint64_t len = string_length(mount_path);
+    uint64_t pos = 0;
+
+    if (len == 0 || out_len == 0) {
+        return -1;
+    }
+    while (len > 1 && mount_path[len - 1] == '/') {
+        len--;
+    }
+    if (len + sizeof(info_name) + 1 >= out_len) {
+        return -1;
+    }
+    for (uint64_t i = 0; i < len; i++) {
+        out[pos++] = mount_path[i];
+    }
+    if (pos == 0 || out[pos - 1] != '/') {
+        out[pos++] = '/';
+    }
+    for (uint64_t i = 0; i < sizeof(info_name) - 1; i++) {
+        out[pos++] = info_name[i];
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static int read_mount_info_text(const char *mount_path, char *info_path,
+                                uint64_t info_path_len, char *buffer,
+                                uint64_t buffer_len) {
+    if (buffer_len < 1024 ||
+        build_mount_info_path(mount_path, info_path, info_path_len) != 0) {
+        return -1;
+    }
+
+    uint64_t fd = sys_open(info_path);
+    if (fd == (uint64_t)-1) {
+        return -1;
+    }
+
+    uint64_t read_len = 0;
+    while (read_len + 1 < buffer_len) {
+        uint64_t chunk = sys_read(fd, buffer + read_len, buffer_len - 1 - read_len);
+        if (chunk == (uint64_t)-1) {
+            sys_close(fd);
+            return -1;
+        }
+        if (chunk == 0) {
+            break;
+        }
+        read_len += chunk;
+    }
+    sys_close(fd);
+
+    if (read_len == 0) {
+        return -1;
+    }
+    buffer[read_len] = '\0';
+    return 0;
+}
+
+static int info_field_value(const char *info, const char *field,
+                            const char **value_out, uint64_t *len_out) {
+    uint64_t field_len = string_length(field);
+
+    for (uint64_t i = 0; info[i] != '\0'; i++) {
+        uint64_t j = 0;
+        if (i != 0 && info[i - 1] != '\n') {
+            continue;
+        }
+        while (j < field_len && info[i + j] == field[j]) {
+            j++;
+        }
+        if (j == field_len) {
+            uint64_t len = 0;
+            const char *value = info + i + field_len;
+            while (value[len] != '\0' && value[len] != '\n') {
+                len++;
+            }
+            *value_out = value;
+            *len_out = len;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int info_field_equals(const char *info, const char *field,
+                             const char *expected) {
+    const char *value;
+    uint64_t len;
+    uint64_t expected_len = string_length(expected);
+
+    if (info_field_value(info, field, &value, &len) != 0 ||
+        len != expected_len) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < len; i++) {
+        if (value[i] != expected[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void writeaudit_field(const char *info, const char *label,
+                             const char *field) {
+    static const char missing[] = "missing";
+    const char *value;
+    uint64_t len;
+
+    write_cstr(label);
+    if (info_field_value(info, field, &value, &len) == 0) {
+        sys_write(STDOUT_FD, value, len);
+    } else {
+        write_literal(missing, sizeof(missing) - 1);
+    }
+    write_literal("\n", 1);
+}
+
+static int writeaudit_info_is_usable(const char *info) {
+    return contains_text(info, "detected_fs: exfat") &&
+           contains_text(info, "write_candidate_ready: ") &&
+           contains_text(info, "write_policy_allows_commit: ") &&
+           contains_text(info, "manual_unlock_attempted: ") &&
+           contains_text(info, "manual_unlock_ready: ") &&
+           contains_text(info, "manual_unlock_blocker: ") &&
+           contains_text(info, "real_write_prereq_ready: ") &&
+           contains_text(info, "real_write_dry_run_lbas: ") &&
+           contains_text(info, "real_write_dry_run_clusters: ");
+}
+
+static void cmd_writeaudit(const char *mount_path, char *buffer,
+                           uint64_t buffer_len) {
+    static const char fail[] = "writeaudit: failed\n";
+    static const char header[] = "writeaudit: ";
+    static const char info_path_prefix[] = "info: ";
+    static const char missing_exfat[] = "result: no_exfat_write_audit\n";
+    static const char writable[] = "result: policy_allows_write\n";
+    static const char readonly[] = "result: readonly_or_locked\n";
+    char info_path[SHELL_PATH_MAX];
+
+    if (read_mount_info_text(mount_path, info_path, sizeof(info_path),
+                             buffer, buffer_len) != 0) {
+        write_literal(fail, sizeof(fail) - 1);
+        return;
+    }
+
+    write_literal(header, sizeof(header) - 1);
+    write_cstr(mount_path);
+    write_literal("\n", 1);
+    write_literal(info_path_prefix, sizeof(info_path_prefix) - 1);
+    write_cstr(info_path);
+    write_literal("\n", 1);
+
+    if (!writeaudit_info_is_usable(buffer)) {
+        write_literal(missing_exfat, sizeof(missing_exfat) - 1);
+        return;
+    }
+
+    writeaudit_field(buffer, "fs: ", "detected_fs: ");
+    writeaudit_field(buffer, "source: ", "source: ");
+    writeaudit_field(buffer, "write_enabled: ", "write_enabled: ");
+    writeaudit_field(buffer, "write_policy: ", "write_policy: ");
+    writeaudit_field(buffer, "write_blocker: ", "write_blocker: ");
+    writeaudit_field(buffer, "manual_unlock_attempted: ",
+                     "manual_unlock_attempted: ");
+    writeaudit_field(buffer, "manual_unlock_ready: ",
+                     "manual_unlock_ready: ");
+    writeaudit_field(buffer, "manual_unlock_blocker: ",
+                     "manual_unlock_blocker: ");
+    writeaudit_field(buffer, "candidate_ready: ", "write_candidate_ready: ");
+    writeaudit_field(buffer, "policy_allows_commit: ",
+                     "write_policy_allows_commit: ");
+    writeaudit_field(buffer, "real_prereq_ready: ",
+                     "real_write_prereq_ready: ");
+    writeaudit_field(buffer, "real_blocker: ", "real_write_blocker: ");
+    writeaudit_field(buffer, "dry_run_action: ",
+                     "real_write_dry_run_action: ");
+    writeaudit_field(buffer, "dry_run_path: ", "real_write_dry_run_path: ");
+    writeaudit_field(buffer, "dry_run_ready: ",
+                     "real_write_dry_run_ready: ");
+    writeaudit_field(buffer, "dry_run_policy_allows: ",
+                     "real_write_dry_run_policy_allows: ");
+    writeaudit_field(buffer, "dry_run_write_count: ",
+                     "real_write_dry_run_write_count: ");
+    writeaudit_field(buffer, "dry_run_lbas: ", "real_write_dry_run_lbas: ");
+    writeaudit_field(buffer, "dry_run_clusters: ",
+                     "real_write_dry_run_clusters: ");
+    writeaudit_field(buffer, "dry_run_note: ",
+                     "real_write_dry_run_note: ");
+
+    if (contains_text(buffer, "write_policy_allows_commit: 1")) {
+        write_literal(writable, sizeof(writable) - 1);
+    } else {
+        write_literal(readonly, sizeof(readonly) - 1);
+    }
+}
+
+static void cmd_writeunlock(const char *mount_path,
+                            uint64_t bitmap_lba,
+                            uint64_t fat_lba,
+                            uint64_t directory_lba) {
+    static const char ok[] = "writeunlock: ok\n";
+    static const char fail[] = "writeunlock: failed\n";
+    struct blockfs_unlock_request request;
+
+    request.magic = BLOCKFS_UNLOCK_MAGIC;
+    request.expected_bitmap_lba = bitmap_lba;
+    request.expected_fat_lba = fat_lba;
+    request.expected_directory_lba = directory_lba;
+    request.flags = 0;
+
+    if (sys_blockfs_unlock(mount_path, &request) == 0) {
+        write_literal(ok, sizeof(ok) - 1);
+    } else {
+        write_literal(fail, sizeof(fail) - 1);
     }
 }
 
@@ -1878,7 +2321,7 @@ static void cmd_run(const char *path, const char *args) {
 
 static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_t buffer_len) {
     static const char help[] =
-        "commands: help, pwd, cd, ls, cat, echo, clear, touch, write, append, rm, stat, cp, mv, hexdump, edit, run, ps, mem, uptime, sysinfo, usb, mounts, lsblk, blkread, blkwrite, usbtestwrite\n";
+        "commands: help, pwd, cd, ls, cat, echo, clear, touch, write, append, rm, stat, cp, mv, hexdump, edit, run, ps, mem, uptime, sysinfo, usb, usbdiag, mounts, lsblk, blkread, blkwrite, usbtestwrite, writeaudit, writeunlock\n";
     static const char unknown[] = "unknown command\n";
     static const char usage_blkread[] = "usage: blkread device lba\n";
     static const char usage_blkwrite[] = "usage: blkwrite device lba text\n";
@@ -1892,6 +2335,9 @@ static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_
     static const char usage_run[] = "usage: run /path.elf [args...]\n";
     static const char usage_stat[] = "usage: stat /path\n";
     static const char usage_touch[] = "usage: touch /path\n";
+    static const char usage_writeaudit[] = "usage: writeaudit [/mount]\n";
+    static const char usage_writeunlock[] =
+        "usage: writeunlock /mount bitmap_lba fat_lba directory_lba TPUSBWRITE\n";
     static const char usage_write[] = "usage: write /path text\n";
     static const char usage_append[] = "usage: append /path text\n";
     static const char cd_fail[] = "cd: failed\n";
@@ -1944,6 +2390,10 @@ static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_
         cmd_usb();
         return;
     }
+    if (strings_equal(line, "usbdiag")) {
+        cmd_usbdiag();
+        return;
+    }
     if (strings_equal(line, "lsblk")) {
         cmd_lsblk();
         return;
@@ -1954,6 +2404,49 @@ static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_
     }
     if (strings_equal(line, "usbtestwrite")) {
         usbtestwrite_run(buffer, buffer_len, 1);
+        return;
+    }
+    if (strings_equal(line, "writeaudit")) {
+        cmd_writeaudit("/usbdisk", buffer, buffer_len);
+        return;
+    }
+    if (starts_with(line, "writeaudit ")) {
+        const char *arg = skip_spaces(line + 11);
+        char token[SHELL_PATH_MAX];
+        if (read_token(token, sizeof(token), arg, 0) == 0 ||
+            resolve_path(cwd, token, path, sizeof(path)) != 0) {
+            write_literal(usage_writeaudit, sizeof(usage_writeaudit) - 1);
+            return;
+        }
+        cmd_writeaudit(path, buffer, buffer_len);
+        return;
+    }
+    if (starts_with(line, "writeunlock ")) {
+        const char *rest = skip_spaces(line + 12);
+        char mount_token[SHELL_PATH_MAX];
+        char bitmap_token[24];
+        char fat_token[24];
+        char dir_token[24];
+        char confirm_token[24];
+        uint64_t bitmap_lba;
+        uint64_t fat_lba;
+        uint64_t directory_lba;
+
+        if (read_token(mount_token, sizeof(mount_token), rest, &rest) == 0 ||
+            read_token(bitmap_token, sizeof(bitmap_token), rest, &rest) == 0 ||
+            read_token(fat_token, sizeof(fat_token), rest, &rest) == 0 ||
+            read_token(dir_token, sizeof(dir_token), rest, &rest) == 0 ||
+            read_token(confirm_token, sizeof(confirm_token), rest, &rest) == 0 ||
+            rest[0] != '\0' ||
+            resolve_path(cwd, mount_token, path, sizeof(path)) != 0 ||
+            parse_u64(bitmap_token, &bitmap_lba) != 0 ||
+            parse_u64(fat_token, &fat_lba) != 0 ||
+            parse_u64(dir_token, &directory_lba) != 0 ||
+            !strings_equal(confirm_token, "TPUSBWRITE")) {
+            write_literal(usage_writeunlock, sizeof(usage_writeunlock) - 1);
+            return;
+        }
+        cmd_writeunlock(path, bitmap_lba, fat_lba, directory_lba);
         return;
     }
     if (starts_with(line, "blkread ")) {
@@ -2427,6 +2920,8 @@ static void run_block_mount_self_test(char *buffer, uint64_t buffer_len) {
     static const char info_commit_verified[] = "commit_verified: 1";
     static const char info_write_enabled[] = "write_enabled: 1";
     static const char info_write_policy[] = "write_policy: writable_test_build";
+    static const char info_write_policy_allows[] = "write_policy_allows_commit: 1";
+    static const char info_write_blocker[] = "write_blocker: none";
 #else
     static const char info_commit_supported[] = "commit_supported: 0";
     static const char info_commit_attempted[] = "commit_attempted: 0";
@@ -2435,7 +2930,41 @@ static void run_block_mount_self_test(char *buffer, uint64_t buffer_len) {
     static const char info_commit_verified[] = "commit_verified: 0";
     static const char info_write_enabled[] = "write_enabled: 0";
     static const char info_write_policy[] = "write_policy: readonly_non_test_media";
+    static const char info_write_policy_allows[] = "write_policy_allows_commit: 0";
+    static const char info_write_blocker[] = "write_blocker: not_write_whitelisted";
 #endif
+    static const char info_write_candidate[] = "write_candidate_ready: 1";
+    static const char info_audit_volume[] = "write_audit_volume_bounds: 1";
+    static const char info_audit_fat[] = "write_audit_fat_bounds: 1";
+    static const char info_audit_heap[] = "write_audit_heap_bounds: 1";
+    static const char info_audit_root[] = "write_audit_root_bounds: 1";
+    static const char info_audit_bitmap[] = "write_audit_bitmap_bounds: 1";
+    static const char info_audit_upcase[] = "write_audit_upcase_bounds: 1";
+    static const char info_active_fat[] = "active_fat: 0";
+    static const char info_volume_dirty[] = "volume_dirty: 0";
+    static const char info_media_failure[] = "media_failure: 0";
+    static const char info_boot_checksum_present[] = "boot_checksum_present: 1";
+    static const char info_boot_checksum_valid[] = "boot_checksum_valid: 1";
+    static const char info_backup_boot_present[] = "backup_boot_sector_present: 1";
+    static const char info_backup_boot_matches[] = "backup_boot_sector_matches: 1";
+    static const char info_backup_checksum_present[] = "backup_boot_checksum_present: 1";
+    static const char info_backup_checksum_valid[] = "backup_boot_checksum_valid: 1";
+    static const char info_real_write_ready[] = "real_write_prereq_ready: 1";
+    static const char info_real_write_blocker[] = "real_write_blocker: none";
+    static const char info_real_dry_action[] = "real_write_dry_run_action: create_root_file";
+    static const char info_real_dry_path[] = "real_write_dry_run_path: /NEW.TXT";
+    static const char info_real_dry_ready[] = "real_write_dry_run_ready: 1";
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    static const char info_real_dry_policy[] = "real_write_dry_run_policy_allows: 1";
+#else
+    static const char info_real_dry_policy[] = "real_write_dry_run_policy_allows: 0";
+#endif
+    static const char info_real_dry_blocker[] = "real_write_dry_run_blocker: none";
+    static const char info_real_dry_writes[] = "real_write_dry_run_write_count: 3";
+    static const char info_real_dry_lbas[] = "real_write_dry_run_lbas: 256 128 192";
+    static const char info_real_dry_clusters[] = "real_write_dry_run_clusters: 12 13 14";
+    static const char info_real_dry_note[] =
+        "real_write_dry_run_note: dry_run_only_until_manual_real_media_unlock";
     static const char sector_signature[] = "EXFAT   ";
     static const char exfat_file_name[] = "HELLO.TXT";
     static const char exfat_file_content[] = "Hello from exFAT root file.\n";
@@ -2568,7 +3097,36 @@ static void run_block_mount_self_test(char *buffer, uint64_t buffer_len) {
         !contains_text(buffer, info_commit_writes) ||
         !contains_text(buffer, info_commit_verified) ||
         !contains_text(buffer, info_write_enabled) ||
-        !contains_text(buffer, info_write_policy)) {
+        !contains_text(buffer, info_write_policy) ||
+        !contains_text(buffer, info_write_candidate) ||
+        !contains_text(buffer, info_write_policy_allows) ||
+        !contains_text(buffer, info_write_blocker) ||
+        !contains_text(buffer, info_audit_volume) ||
+        !contains_text(buffer, info_audit_fat) ||
+        !contains_text(buffer, info_audit_heap) ||
+        !contains_text(buffer, info_audit_root) ||
+        !contains_text(buffer, info_audit_bitmap) ||
+        !contains_text(buffer, info_audit_upcase) ||
+        !contains_text(buffer, info_active_fat) ||
+        !contains_text(buffer, info_volume_dirty) ||
+        !contains_text(buffer, info_media_failure) ||
+        !contains_text(buffer, info_boot_checksum_present) ||
+        !contains_text(buffer, info_boot_checksum_valid) ||
+        !contains_text(buffer, info_backup_boot_present) ||
+        !contains_text(buffer, info_backup_boot_matches) ||
+        !contains_text(buffer, info_backup_checksum_present) ||
+        !contains_text(buffer, info_backup_checksum_valid) ||
+        !contains_text(buffer, info_real_write_ready) ||
+        !contains_text(buffer, info_real_write_blocker) ||
+        !contains_text(buffer, info_real_dry_action) ||
+        !contains_text(buffer, info_real_dry_path) ||
+        !contains_text(buffer, info_real_dry_ready) ||
+        !contains_text(buffer, info_real_dry_policy) ||
+        !contains_text(buffer, info_real_dry_blocker) ||
+        !contains_text(buffer, info_real_dry_writes) ||
+        !contains_text(buffer, info_real_dry_lbas) ||
+        !contains_text(buffer, info_real_dry_clusters) ||
+        !contains_text(buffer, info_real_dry_note)) {
         write_literal("block mount step: transaction commit gate\n", 41);
         write_literal(fail, sizeof(fail) - 1);
         sys_exit(24);
@@ -3018,6 +3576,19 @@ static void run_usb_mount_self_test(char *buffer, uint64_t buffer_len) {
     static const char info_fs[] = "detected_fs: exfat";
     static const char info_write_enabled[] = "write_enabled: 1";
     static const char info_write_policy[] = "write_policy: writable_test_usb";
+    static const char info_write_candidate[] = "write_candidate_ready: 1";
+    static const char info_write_policy_allows[] = "write_policy_allows_commit: 1";
+    static const char info_write_blocker[] = "write_blocker: none";
+    static const char info_manual_attempted[] = "manual_unlock_attempted: 0";
+    static const char info_manual_ready[] = "manual_unlock_ready: 0";
+    static const char info_manual_blocker[] = "manual_unlock_blocker: none";
+    static const char info_real_write_ready[] = "real_write_prereq_ready: 1";
+    static const char info_real_write_blocker[] = "real_write_blocker: none";
+    static const char info_real_dry_ready[] = "real_write_dry_run_ready: 1";
+    static const char info_real_dry_policy[] = "real_write_dry_run_policy_allows: 1";
+    static const char info_real_dry_lbas[] = "real_write_dry_run_lbas: 256 128 192";
+    static const char info_real_dry_note[] =
+        "real_write_dry_run_note: dry_run_only_until_manual_real_media_unlock";
     static const char info_commit_ready[] = "commit_ready: 1";
     uint64_t fd = sys_open(path);
     uint64_t read_len = 0;
@@ -3055,6 +3626,18 @@ static void run_usb_mount_self_test(char *buffer, uint64_t buffer_len) {
         !contains_text(buffer, info_fs) ||
         !contains_text(buffer, info_write_enabled) ||
         !contains_text(buffer, info_write_policy) ||
+        !contains_text(buffer, info_write_candidate) ||
+        !contains_text(buffer, info_write_policy_allows) ||
+        !contains_text(buffer, info_write_blocker) ||
+        !contains_text(buffer, info_manual_attempted) ||
+        !contains_text(buffer, info_manual_ready) ||
+        !contains_text(buffer, info_manual_blocker) ||
+        !contains_text(buffer, info_real_write_ready) ||
+        !contains_text(buffer, info_real_write_blocker) ||
+        !contains_text(buffer, info_real_dry_ready) ||
+        !contains_text(buffer, info_real_dry_policy) ||
+        !contains_text(buffer, info_real_dry_lbas) ||
+        !contains_text(buffer, info_real_dry_note) ||
         !contains_text(buffer, info_commit_ready)) {
         write_literal(fail, sizeof(fail) - 1);
         sys_exit(29);
@@ -3062,6 +3645,75 @@ static void run_usb_mount_self_test(char *buffer, uint64_t buffer_len) {
 
     write_literal(ok, sizeof(ok) - 1);
 }
+
+static void run_writeaudit_self_test(char *buffer, uint64_t buffer_len) {
+    static const char ok[] = "shell.elf: writeaudit self-test ok\n";
+    static const char fail[] = "shell.elf: writeaudit self-test failed\n";
+    char info_path[SHELL_PATH_MAX];
+
+    if (read_mount_info_text("/usbdisk", info_path, sizeof(info_path),
+                             buffer, buffer_len) != 0) {
+        return;
+    }
+    if (!writeaudit_info_is_usable(buffer) ||
+        !info_field_equals(buffer, "detected_fs: ", "exfat") ||
+        !info_field_equals(buffer, "write_candidate_ready: ", "1") ||
+        !info_field_equals(buffer, "write_policy_allows_commit: ", "1") ||
+        !info_field_equals(buffer, "real_write_prereq_ready: ", "1") ||
+        !contains_text(buffer, "real_write_dry_run_lbas: ") ||
+        !contains_text(buffer, "real_write_dry_run_clusters: ")) {
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(33);
+    }
+
+    write_literal(ok, sizeof(ok) - 1);
+}
+
+static void run_writeunlock_reject_self_test(void) {
+    static const char ok[] = "shell.elf: writeunlock reject self-test ok\n";
+    static const char fail[] = "shell.elf: writeunlock reject self-test failed\n";
+    struct blockfs_unlock_request request;
+
+    request.magic = BLOCKFS_UNLOCK_MAGIC;
+    request.expected_bitmap_lba = 256;
+    request.expected_fat_lba = 128;
+    request.expected_directory_lba = 192;
+    request.flags = 0;
+
+    if (sys_blockfs_unlock("/missing", &request) != (uint64_t)-1) {
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(35);
+    }
+
+    write_literal(ok, sizeof(ok) - 1);
+}
+
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+static void run_writeunlock_success_self_test(char *buffer, uint64_t buffer_len) {
+    static const char ok[] = "shell.elf: writeunlock success self-test ok\n";
+    static const char fail[] = "shell.elf: writeunlock success self-test failed\n";
+    struct blockfs_unlock_request request;
+    char info_path[SHELL_PATH_MAX];
+
+    request.magic = BLOCKFS_UNLOCK_MAGIC;
+    request.expected_bitmap_lba = 256;
+    request.expected_fat_lba = 128;
+    request.expected_directory_lba = 192;
+    request.flags = 0;
+
+    if (sys_blockfs_unlock("/usbdisk", &request) != 0 ||
+        read_mount_info_text("/usbdisk", info_path, sizeof(info_path),
+                             buffer, buffer_len) != 0 ||
+        !info_field_equals(buffer, "manual_unlock_attempted: ", "1") ||
+        !info_field_equals(buffer, "manual_unlock_ready: ", "1") ||
+        !info_field_equals(buffer, "manual_unlock_blocker: ", "none")) {
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(36);
+    }
+
+    write_literal(ok, sizeof(ok) - 1);
+}
+#endif
 
 static void run_usb_fat32_mount_self_test(char *buffer, uint64_t buffer_len) {
     static const char ok[] = "shell.elf: USB FAT32 mount read ok\n";
@@ -3452,7 +4104,7 @@ void _start(void) {
     write_u64_hex(sys_brk(0));
     write_literal(newline, sizeof(newline) - 1);
 
-    char *heap = sys_sbrk(8192);
+    char *heap = sys_sbrk(12288);
     if (heap == (void *)0) {
         write_literal(heap_fail, sizeof(heap_fail) - 1);
         sys_exit(8);
@@ -3470,14 +4122,19 @@ void _start(void) {
     run_block_self_test(heap, 512);
     run_virtio_block_self_test(heap, 512);
     run_mount_info_self_test();
-    run_block_mount_self_test(heap, 8192);
-    run_fat32_mount_self_test(heap, 8192);
-    run_usb_mount_self_test(heap, 8192);
-    run_usb_fat32_mount_self_test(heap, 8192);
-    run_usb_block_write_self_test(heap, 8192);
-    run_usb_exfat_user_write_self_test(heap, 8192);
+    run_block_mount_self_test(heap, 12288);
+    run_fat32_mount_self_test(heap, 12288);
+    run_usb_mount_self_test(heap, 12288);
+    run_writeaudit_self_test(heap, 12288);
+    run_writeunlock_reject_self_test();
 #ifdef TANGPINGOS_TEST_EXFAT_COMMIT
-    run_exfat_vfs_write_self_test(heap, 8192);
+    run_writeunlock_success_self_test(heap, 12288);
+#endif
+    run_usb_fat32_mount_self_test(heap, 12288);
+    run_usb_block_write_self_test(heap, 12288);
+    run_usb_exfat_user_write_self_test(heap, 12288);
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    run_exfat_vfs_write_self_test(heap, 12288);
 #endif
     cmd_ls("/");
     cmd_cat("/ram-note.txt", heap, 256);
@@ -3508,5 +4165,5 @@ void _start(void) {
     *(volatile uint64_t *)0 = 0x55;
 #endif
 
-    run_interactive_shell(input_fd, heap, 256);
+    run_interactive_shell(input_fd, heap, 12288);
 }

@@ -18,11 +18,15 @@ programs.
   `unlink`, `spawn`, path-based VFS mount dispatch, mount-table queries, and
   basic system information syscalls.
 - Provides a block-device layer with in-memory `ramblk0`, QEMU virtio-blk
-  `vd0`, MBR primary partition devices such as `vd0p1` and `vd0p2`, an exFAT
+  `vd0`, MBR/GPT partition devices such as `vd0p1` and `vd0p2`, an exFAT
   test mount at `/usb` with guarded write-path validation builds, a USB
   Mass Storage exFAT test mount at `/usbdisk` in QEMU with whitelisted
-  uppercase 8.3 root-file writes, and readonly FAT32 boot-partition samples
-  mounted at `/boot` and `/usbboot`.
+  uppercase 8.3 root-file writes, readonly FAT32 boot-partition samples
+  mounted at `/boot` and `/usbboot`, and conservative readonly probing for
+  non-QEMU xHCI USB Mass Storage devices with exFAT write-readiness audit
+  plus main/backup boot-region checksum and dry-run write-sector reporting
+  exposed through `/usbdisk/info.txt`, `writeaudit`, and a guarded manual
+  `writeunlock` command that is still off by default for real media.
 - Includes an interactive shell plus standalone `/bin/hello.elf`,
   `/bin/ls.elf`, and `/bin/cat.elf` user programs.
 
@@ -71,6 +75,7 @@ make cat
 make iso
 make clean
 make disk
+make usb-gpt-disk
 make test-exception
 make test-page-fault
 make test-user-fault

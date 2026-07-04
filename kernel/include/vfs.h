@@ -73,6 +73,9 @@ int vfs_register_fs_mount(const char *name, const char *path, const char *source
                           vfs_read_fn read, vfs_list_fn list, vfs_write_fn write,
                           vfs_size_fn size, vfs_truncate_fn truncate, vfs_unlink_fn unlink,
                           void *context);
+int vfs_update_mount_write_handlers(void *context, vfs_write_fn write,
+                                    vfs_truncate_fn truncate,
+                                    vfs_unlink_fn unlink);
 int vfs_mount_info(uint64_t index, struct vfs_mount_info *out);
 int vfs_file_exists(const char *path);
 int vfs_list_dir(const char *path, uint64_t index, struct vfs_dirent *out);

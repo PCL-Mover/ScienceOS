@@ -35,5 +35,6 @@ int block_get_info(uint64_t index, struct block_device_info *out);
 int block_find_by_name(const char *name, uint64_t *index_out);
 int block_read(uint64_t index, uint64_t lba, uint64_t count, void *buffer);
 int block_write(uint64_t index, uint64_t lba, uint64_t count, const void *buffer);
+int block_set_writable(uint64_t index, uint64_t writable);
 
 #endif

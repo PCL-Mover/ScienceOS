@@ -5,18 +5,21 @@
 #include <vfs.h>
 
 #define BLOCKFS_MAX_MOUNTS 4
-#define BLOCKFS_INFO_MAX 8192
+#define BLOCKFS_INFO_MAX 12288
 #define BLOCKFS_MAX_EXFAT_ROOT_ENTRIES 32
 #define BLOCKFS_MAX_ROOT_ENTRIES BLOCKFS_MAX_EXFAT_ROOT_ENTRIES
 #define EXFAT_ENTRY_SIZE 32
 #define EXFAT_ALLOC_PLAN_CLUSTER_COUNT 3
 #define EXFAT_TEST_FILE_DEFAULT_CLUSTERS EXFAT_ALLOC_PLAN_CLUSTER_COUNT
 #define EXFAT_CREATE_PLAN_NAME "NEW.TXT"
+#define EXFAT_REAL_WRITE_DRY_RUN_ACTION "create_root_file"
 #define EXFAT_CREATE_PLAN_NAME_CHARS 7
 #define EXFAT_CREATE_PLAN_MAX_NAME_CHARS 15
 #define EXFAT_CREATE_PLAN_REQUIRED_ENTRIES 3
 #define EXFAT_CREATE_PLAN_ENTRY_BYTES (EXFAT_CREATE_PLAN_REQUIRED_ENTRIES * EXFAT_ENTRY_SIZE)
 #define EXFAT_TEST_TX_MAX_SECTORS 4
+#define EXFAT_BOOT_REGION_SECTORS 12
+#define EXFAT_BOOT_CHECKSUM_INPUT_SECTORS 11
 
 struct exfat_boot_info {
     int present;
@@ -35,6 +38,16 @@ struct exfat_boot_info {
     uint8_t number_of_fats;
     uint8_t drive_select;
     uint8_t percent_in_use;
+    uint32_t boot_checksum_expected;
+    uint32_t boot_checksum_stored;
+    int boot_checksum_present;
+    int boot_checksum_valid;
+    int backup_boot_sector_present;
+    int backup_boot_sector_matches;
+    uint32_t backup_boot_checksum_expected;
+    uint32_t backup_boot_checksum_stored;
+    int backup_boot_checksum_present;
+    int backup_boot_checksum_valid;
     int allocation_bitmap_present;
     uint8_t allocation_bitmap_flags;
     uint32_t allocation_bitmap_cluster;
@@ -90,6 +103,10 @@ struct exfat_boot_info {
     uint64_t commit_write_count;
     int commit_verified;
     int write_whitelisted;
+    int manual_unlock_attempted;
+    int manual_unlock_ready;
+    int manual_unlock_armed;
+    char manual_unlock_blocker[64];
     int upcase_table_present;
     uint32_t upcase_table_checksum;
     uint32_t upcase_table_cluster;
@@ -139,6 +156,7 @@ struct blockfs_mount {
     int in_use;
     uint64_t block_index;
     struct block_device_info block;
+    char mount_path[VFS_MOUNT_PATH_MAX];
     char source[VFS_MOUNT_SOURCE_MAX];
     struct exfat_boot_info exfat;
     struct fat32_boot_info fat32;
@@ -147,7 +165,9 @@ struct blockfs_mount {
 };
 
 static struct blockfs_mount mounts[BLOCKFS_MAX_MOUNTS];
+static char blockfs_info_buffer[BLOCKFS_INFO_MAX];
 
+static void copy_limited(char *dst, uint64_t dst_len, const char *src);
 static void commit_exfat_create_transaction_for_test(struct blockfs_mount *mount);
 static int refresh_exfat_test_file_size_for_test(struct blockfs_mount *mount,
                                                  struct exfat_root_entry *entry,
@@ -173,6 +193,42 @@ static int chars_equal(const char *a, const char *b) {
     }
 
     return *a == '\0' && *b == '\0';
+}
+
+static int chars_starts_with(const char *s, const char *prefix) {
+    if (s == 0 || prefix == 0) {
+        return 0;
+    }
+    while (*prefix != '\0') {
+        if (*s != *prefix) {
+            return 0;
+        }
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
+static struct blockfs_mount *find_blockfs_mount_by_path(const char *mount_path) {
+    if (mount_path == 0) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < BLOCKFS_MAX_MOUNTS; i++) {
+        if (mounts[i].in_use && chars_equal(mounts[i].mount_path, mount_path)) {
+            return &mounts[i];
+        }
+    }
+    return 0;
+}
+
+static void set_exfat_manual_unlock_blocker(struct blockfs_mount *mount,
+                                            const char *blocker) {
+    if (mount == 0) {
+        return;
+    }
+    copy_limited(mount->exfat.manual_unlock_blocker,
+                 sizeof(mount->exfat.manual_unlock_blocker),
+                 blocker == 0 ? "unknown" : blocker);
 }
 
 static char ascii_upper(char c) {
@@ -522,6 +578,110 @@ static void parse_exfat_boot_sector(struct blockfs_mount *mount, const uint8_t *
     mount->exfat.percent_in_use = sector[112];
 }
 
+static uint32_t exfat_boot_checksum_step(uint32_t checksum, uint8_t value) {
+    return ((checksum & 1U) != 0 ? 0x80000000U : 0U) +
+           (checksum >> 1) +
+           (uint32_t)value;
+}
+
+static uint32_t exfat_boot_checksum_region(const uint8_t *sectors) {
+    uint32_t checksum = 0;
+    uint64_t total = EXFAT_BOOT_CHECKSUM_INPUT_SECTORS * 512ULL;
+
+    for (uint64_t i = 0; i < total; i++) {
+        uint64_t sector = i / 512ULL;
+        uint64_t offset = i % 512ULL;
+
+        if (sector == 0 && (offset == 106 || offset == 107 || offset == 112)) {
+            continue;
+        }
+        checksum = exfat_boot_checksum_step(checksum, sectors[i]);
+    }
+    return checksum;
+}
+
+static int exfat_checksum_sector_valid(const uint8_t *sector,
+                                       uint32_t expected,
+                                       uint32_t *stored_out,
+                                       int *present_out) {
+    int present = 0;
+
+    for (uint64_t off = 0; off < 512; off += 4) {
+        uint32_t stored = read_le32(sector + off);
+        if (off == 0 && stored_out != 0) {
+            *stored_out = stored;
+        }
+        if (stored != 0) {
+            present = 1;
+        }
+        if (stored != expected) {
+            if (present_out != 0) {
+                *present_out = present;
+            }
+            return 0;
+        }
+    }
+    if (present_out != 0) {
+        *present_out = present;
+    }
+    return present;
+}
+
+static int bytes_match(const uint8_t *a, const uint8_t *b, uint64_t len) {
+    for (uint64_t i = 0; i < len; i++) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void analyze_exfat_boot_regions(struct blockfs_mount *mount) {
+    static uint8_t main_region[EXFAT_BOOT_REGION_SECTORS * 512];
+    static uint8_t backup_region[EXFAT_BOOT_REGION_SECTORS * 512];
+    uint8_t *main_checksum_sector;
+    uint8_t *backup_checksum_sector;
+
+    if (mount == 0 || !mount->exfat.present || mount->block.block_size != 512) {
+        return;
+    }
+    if (block_read(mount->block_index, 0, EXFAT_BOOT_REGION_SECTORS, main_region) != 0) {
+        return;
+    }
+
+    main_checksum_sector = main_region + EXFAT_BOOT_CHECKSUM_INPUT_SECTORS * 512ULL;
+    mount->exfat.boot_checksum_expected = exfat_boot_checksum_region(main_region);
+    mount->exfat.boot_checksum_valid =
+        exfat_checksum_sector_valid(main_checksum_sector,
+                                    mount->exfat.boot_checksum_expected,
+                                    &mount->exfat.boot_checksum_stored,
+                                    &mount->exfat.boot_checksum_present);
+
+    if (mount->block.block_count < EXFAT_BOOT_REGION_SECTORS * 2ULL ||
+        block_read(mount->block_index,
+                   EXFAT_BOOT_REGION_SECTORS,
+                   EXFAT_BOOT_REGION_SECTORS,
+                   backup_region) != 0) {
+        return;
+    }
+
+    mount->exfat.backup_boot_sector_present =
+        bytes_equal(backup_region + 3, "EXFAT   ", 8) &&
+        backup_region[510] == 0x55 &&
+        backup_region[511] == 0xaa;
+    mount->exfat.backup_boot_sector_matches =
+        mount->exfat.backup_boot_sector_present &&
+        bytes_match(main_region, backup_region, 512);
+
+    backup_checksum_sector = backup_region + EXFAT_BOOT_CHECKSUM_INPUT_SECTORS * 512ULL;
+    mount->exfat.backup_boot_checksum_expected = exfat_boot_checksum_region(backup_region);
+    mount->exfat.backup_boot_checksum_valid =
+        exfat_checksum_sector_valid(backup_checksum_sector,
+                                    mount->exfat.backup_boot_checksum_expected,
+                                    &mount->exfat.backup_boot_checksum_stored,
+                                    &mount->exfat.backup_boot_checksum_present);
+}
+
 static void parse_fat32_boot_sector(struct blockfs_mount *mount, const uint8_t *sector) {
     uint16_t bytes_per_sector;
     uint8_t sectors_per_cluster;
@@ -649,6 +809,200 @@ static int exfat_geometry_valid(const struct blockfs_mount *mount) {
            mount->exfat.cluster_heap_offset > 0 &&
            mount->exfat.root_dir_cluster >= 2 &&
            mount->exfat.root_dir_cluster < mount->exfat.cluster_count + 2;
+}
+
+static int range_within_limit(uint64_t start, uint64_t length, uint64_t limit) {
+    return length > 0 && start <= limit && length <= limit - start;
+}
+
+static int exfat_volume_bounds_valid(const struct blockfs_mount *mount) {
+    return mount != 0 &&
+           mount->exfat.present &&
+           mount->exfat.volume_length > 0 &&
+           mount->exfat.volume_length <= mount->block.block_count;
+}
+
+static int exfat_fat_bounds_valid(const struct blockfs_mount *mount) {
+    return mount != 0 &&
+           exfat_volume_bounds_valid(mount) &&
+           range_within_limit(mount->exfat.fat_offset,
+                              mount->exfat.fat_length,
+                              mount->exfat.volume_length);
+}
+
+static int exfat_cluster_heap_bounds_valid(const struct blockfs_mount *mount) {
+    uint64_t sectors_per_cluster;
+    uint64_t heap_sectors;
+
+    if (mount == 0 || !exfat_volume_bounds_valid(mount)) {
+        return 0;
+    }
+    sectors_per_cluster = one_shifted_by(mount->exfat.sectors_per_cluster_shift);
+    if (sectors_per_cluster == 0 ||
+        mount->exfat.cluster_count == 0 ||
+        mount->exfat.cluster_count > UINT64_MAX / sectors_per_cluster) {
+        return 0;
+    }
+    heap_sectors = (uint64_t)mount->exfat.cluster_count * sectors_per_cluster;
+    return range_within_limit(mount->exfat.cluster_heap_offset,
+                              heap_sectors,
+                              mount->exfat.volume_length);
+}
+
+static int exfat_root_dir_bounds_valid(const struct blockfs_mount *mount) {
+    return mount != 0 &&
+           exfat_cluster_heap_bounds_valid(mount) &&
+           mount->exfat.root_dir_cluster >= 2 &&
+           mount->exfat.root_dir_cluster < mount->exfat.cluster_count + 2;
+}
+
+static int exfat_cluster_number_in_bounds(const struct blockfs_mount *mount, uint32_t cluster) {
+    return mount != 0 &&
+           exfat_cluster_heap_bounds_valid(mount) &&
+           cluster >= 2 &&
+           cluster < mount->exfat.cluster_count + 2;
+}
+
+static int exfat_bitmap_bounds_valid(const struct blockfs_mount *mount) {
+    uint64_t min_bitmap_size;
+
+    if (mount == 0 ||
+        !mount->exfat.allocation_bitmap_present ||
+        !exfat_cluster_number_in_bounds(mount, mount->exfat.allocation_bitmap_cluster)) {
+        return 0;
+    }
+    min_bitmap_size = ((uint64_t)mount->exfat.cluster_count + 7) / 8;
+    return mount->exfat.allocation_bitmap_size >= min_bitmap_size;
+}
+
+static int exfat_upcase_bounds_valid(const struct blockfs_mount *mount) {
+    return mount != 0 &&
+           mount->exfat.upcase_table_present &&
+           exfat_cluster_number_in_bounds(mount, mount->exfat.upcase_table_cluster) &&
+           mount->exfat.upcase_table_size > 0;
+}
+
+static int exfat_write_metadata_ready(const struct blockfs_mount *mount) {
+    return mount != 0 &&
+           mount->exfat.present &&
+           exfat_geometry_valid(mount) &&
+           exfat_volume_bounds_valid(mount) &&
+           exfat_fat_bounds_valid(mount) &&
+           exfat_cluster_heap_bounds_valid(mount) &&
+           exfat_root_dir_bounds_valid(mount) &&
+           exfat_bitmap_bounds_valid(mount) &&
+           exfat_upcase_bounds_valid(mount) &&
+           mount->exfat.allocation_bitmap_complete &&
+           mount->exfat.allocation_plan_ready &&
+           mount->exfat.create_plan_ready &&
+           mount->exfat.create_plan_entries_ready &&
+           mount->exfat.transaction_plan_ready &&
+           mount->exfat.patched_transaction_ready;
+}
+
+static int exfat_volume_dirty(const struct blockfs_mount *mount) {
+    return mount != 0 && (mount->exfat.flags & 0x0002U) != 0;
+}
+
+static int exfat_media_failure(const struct blockfs_mount *mount) {
+    return mount != 0 && (mount->exfat.flags & 0x0004U) != 0;
+}
+
+static uint64_t exfat_active_fat_index(const struct blockfs_mount *mount) {
+    return mount == 0 ? 0 : (uint64_t)(mount->exfat.flags & 0x0001U);
+}
+
+static int exfat_real_write_prereq_ready(const struct blockfs_mount *mount) {
+    return exfat_write_metadata_ready(mount) &&
+           mount->exfat.number_of_fats == 1 &&
+           !exfat_volume_dirty(mount) &&
+           !exfat_media_failure(mount) &&
+           mount->exfat.boot_checksum_valid &&
+           mount->exfat.backup_boot_sector_present &&
+           mount->exfat.backup_boot_sector_matches &&
+           mount->exfat.backup_boot_checksum_valid;
+}
+
+static const char *exfat_real_write_blocker_string(struct blockfs_mount *mount) {
+    if (mount == 0 || !mount->exfat.present) {
+        return "not_exfat";
+    }
+    if (!exfat_write_metadata_ready(mount)) {
+        return "metadata_not_ready";
+    }
+    if (mount->exfat.number_of_fats != 1) {
+        return "multiple_fats_unsupported";
+    }
+    if (exfat_volume_dirty(mount)) {
+        return "volume_dirty";
+    }
+    if (exfat_media_failure(mount)) {
+        return "media_failure";
+    }
+    if (!mount->exfat.boot_checksum_valid) {
+        return "main_boot_checksum_invalid";
+    }
+    if (!mount->exfat.backup_boot_sector_present) {
+        return "backup_boot_sector_missing";
+    }
+    if (!mount->exfat.backup_boot_sector_matches) {
+        return "backup_boot_sector_mismatch";
+    }
+    if (!mount->exfat.backup_boot_checksum_valid) {
+        return "backup_boot_checksum_invalid";
+    }
+    return "none";
+}
+
+static int exfat_real_write_dry_run_ready(struct blockfs_mount *mount) {
+    return exfat_real_write_prereq_ready(mount) &&
+           mount != 0 &&
+           mount->exfat.transaction_plan_ready &&
+           mount->exfat.patched_transaction_ready;
+}
+
+static const char *exfat_write_blocker_string(struct blockfs_mount *mount) {
+    if (mount == 0 || !mount->exfat.present) {
+        return "not_exfat";
+    }
+    if (!exfat_geometry_valid(mount)) {
+        return "geometry_invalid";
+    }
+    if (!exfat_volume_bounds_valid(mount)) {
+        return "volume_bounds_invalid";
+    }
+    if (!exfat_fat_bounds_valid(mount)) {
+        return "fat_bounds_invalid";
+    }
+    if (!exfat_cluster_heap_bounds_valid(mount)) {
+        return "cluster_heap_bounds_invalid";
+    }
+    if (!exfat_root_dir_bounds_valid(mount)) {
+        return "root_dir_bounds_invalid";
+    }
+    if (!exfat_bitmap_bounds_valid(mount)) {
+        return "bitmap_bounds_invalid";
+    }
+    if (!exfat_upcase_bounds_valid(mount)) {
+        return "upcase_bounds_invalid";
+    }
+    if (!mount->exfat.allocation_bitmap_complete) {
+        return "bitmap_scan_incomplete";
+    }
+    if (!mount->exfat.allocation_plan_ready ||
+        !mount->exfat.create_plan_ready ||
+        !mount->exfat.create_plan_entries_ready ||
+        !mount->exfat.transaction_plan_ready ||
+        !mount->exfat.patched_transaction_ready) {
+        return "metadata_plan_incomplete";
+    }
+    if (!mount->block.writable) {
+        return "readonly_block_device";
+    }
+    if (!mount->exfat.commit_ready) {
+        return "not_write_whitelisted";
+    }
+    return "none";
 }
 
 static uint64_t exfat_cluster_lba(const struct blockfs_mount *mount, uint32_t cluster) {
@@ -1043,6 +1397,10 @@ static void reset_exfat_transaction_plan(struct blockfs_mount *mount) {
     mount->exfat.commit_write_count = 0;
     mount->exfat.commit_verified = 0;
     mount->exfat.write_whitelisted = 0;
+    mount->exfat.manual_unlock_attempted = 0;
+    mount->exfat.manual_unlock_ready = 0;
+    mount->exfat.manual_unlock_armed = 0;
+    mount->exfat.manual_unlock_blocker[0] = '\0';
     for (uint64_t i = 0; i < EXFAT_ALLOC_PLAN_CLUSTER_COUNT; i++) {
         mount->exfat.transaction_fat_offsets[i] = 0;
         mount->exfat.transaction_fat_old_values[i] = 0;
@@ -1088,6 +1446,11 @@ static int exfat_write_commit_allowed(struct blockfs_mount *mount) {
 #ifdef TANGPINGOS_TEST_EXFAT_COMMIT
     return mount != 0 && mount->exfat.present && mount->block.writable;
 #else
+    if (mount != 0 && mount->exfat.manual_unlock_armed) {
+        return mount->exfat.present &&
+               mount->block.writable &&
+               exfat_real_write_prereq_ready(mount);
+    }
     return exfat_usb_test_media_whitelisted(mount);
 #endif
 }
@@ -1102,12 +1465,22 @@ static const char *exfat_write_policy_string(struct blockfs_mount *mount) {
     if (mount->exfat.commit_ready && mount->exfat.write_whitelisted) {
         return "writable_test_usb";
     }
+    if (mount->exfat.commit_ready && mount->exfat.manual_unlock_ready) {
+        return "writable_manual_usb";
+    }
 #ifdef TANGPINGOS_TEST_EXFAT_COMMIT
     if (mount->exfat.commit_ready) {
         return "writable_test_build";
     }
 #endif
     return "readonly_non_test_media";
+}
+
+static const char *exfat_manual_unlock_blocker_string(struct blockfs_mount *mount) {
+    if (mount == 0 || mount->exfat.manual_unlock_blocker[0] == '\0') {
+        return "none";
+    }
+    return mount->exfat.manual_unlock_blocker;
 }
 
 static int apply_exfat_create_transaction_to_sectors(struct blockfs_mount *mount,
@@ -2508,6 +2881,60 @@ static void append_exfat_allocation_plan(struct blockfs_mount *mount,
     append_string(buffer, buffer_len, pos, "->EOF");
 }
 
+static void append_exfat_real_write_dry_run(struct blockfs_mount *mount,
+                                            char *buffer,
+                                            uint64_t buffer_len,
+                                            uint64_t *pos) {
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_action: ");
+    append_string(buffer, buffer_len, pos, EXFAT_REAL_WRITE_DRY_RUN_ACTION);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_path: /");
+    append_string(buffer, buffer_len, pos, EXFAT_CREATE_PLAN_NAME);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_ready: ");
+    append_u64(buffer, buffer_len, pos, exfat_real_write_dry_run_ready(mount));
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_policy_allows: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.commit_ready);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_blocker: ");
+    append_string(buffer, buffer_len, pos, exfat_real_write_blocker_string(mount));
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_write_count: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.transaction_plan_write_count);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_lbas: ");
+    if (mount->exfat.transaction_plan_ready) {
+        append_u64(buffer, buffer_len, pos, mount->exfat.transaction_bitmap_lba);
+        append_char(buffer, buffer_len, pos, ' ');
+        append_u64(buffer, buffer_len, pos, mount->exfat.transaction_fat_lba);
+        append_char(buffer, buffer_len, pos, ' ');
+        append_u64(buffer, buffer_len, pos, mount->exfat.transaction_directory_lba);
+    } else {
+        append_string(buffer, buffer_len, pos, "none");
+    }
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_bitmap_lba: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.transaction_bitmap_lba);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_fat_lba: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.transaction_fat_lba);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_directory_lba: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.transaction_directory_lba);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_directory_offset: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.transaction_directory_byte_offset);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_file_size: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.create_plan_file_size);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_first_cluster: ");
+    append_u64(buffer, buffer_len, pos, mount->exfat.create_plan_first_cluster);
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_clusters: ");
+    if (mount->exfat.allocation_plan_ready) {
+        for (uint64_t i = 0; i < EXFAT_ALLOC_PLAN_CLUSTER_COUNT; i++) {
+            if (i > 0) {
+                append_char(buffer, buffer_len, pos, ' ');
+            }
+            append_u64(buffer, buffer_len, pos, mount->exfat.allocation_plan_clusters[i]);
+        }
+    } else {
+        append_string(buffer, buffer_len, pos, "none");
+    }
+    append_string(buffer, buffer_len, pos, "\nreal_write_dry_run_note: ");
+    append_string(buffer, buffer_len, pos,
+                  "dry_run_only_until_manual_real_media_unlock");
+}
+
 static void append_exfat_create_plan(struct blockfs_mount *mount,
                                      char *buffer,
                                      uint64_t buffer_len,
@@ -2954,6 +3381,8 @@ static uint64_t build_info(struct blockfs_mount *mount, char *buffer, uint64_t b
     append_string(buffer, buffer_len, &pos, "TangPingOS block-backed mount\n");
     append_string(buffer, buffer_len, &pos, "device: ");
     append_string(buffer, buffer_len, &pos, mount->block.name);
+    append_string(buffer, buffer_len, &pos, "\nsource: ");
+    append_string(buffer, buffer_len, &pos, mount->source);
     append_string(buffer, buffer_len, &pos, "\nblock_size: ");
     append_u64(buffer, buffer_len, &pos, mount->block.block_size);
     append_string(buffer, buffer_len, &pos, "\nblocks: ");
@@ -2984,12 +3413,71 @@ static uint64_t build_info(struct blockfs_mount *mount, char *buffer, uint64_t b
         append_u64(buffer, buffer_len, &pos, mount->exfat.root_dir_cluster);
         append_string(buffer, buffer_len, &pos, "\nnumber_of_fats: ");
         append_u64(buffer, buffer_len, &pos, mount->exfat.number_of_fats);
+        append_string(buffer, buffer_len, &pos, "\nactive_fat: ");
+        append_u64(buffer, buffer_len, &pos, exfat_active_fat_index(mount));
+        append_string(buffer, buffer_len, &pos, "\nvolume_serial: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.volume_serial);
+        append_string(buffer, buffer_len, &pos, "\nvolume_flags: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.flags);
+        append_string(buffer, buffer_len, &pos, "\nvolume_dirty: ");
+        append_u64(buffer, buffer_len, &pos, exfat_volume_dirty(mount));
+        append_string(buffer, buffer_len, &pos, "\nmedia_failure: ");
+        append_u64(buffer, buffer_len, &pos, exfat_media_failure(mount));
         append_string(buffer, buffer_len, &pos, "\npercent_in_use: ");
         append_u64(buffer, buffer_len, &pos, mount->exfat.percent_in_use);
+        append_string(buffer, buffer_len, &pos, "\nboot_checksum_expected: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.boot_checksum_expected);
+        append_string(buffer, buffer_len, &pos, "\nboot_checksum_stored: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.boot_checksum_stored);
+        append_string(buffer, buffer_len, &pos, "\nboot_checksum_present: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.boot_checksum_present);
+        append_string(buffer, buffer_len, &pos, "\nboot_checksum_valid: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.boot_checksum_valid);
+        append_string(buffer, buffer_len, &pos, "\nbackup_boot_sector_present: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.backup_boot_sector_present);
+        append_string(buffer, buffer_len, &pos, "\nbackup_boot_sector_matches: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.backup_boot_sector_matches);
+        append_string(buffer, buffer_len, &pos, "\nbackup_boot_checksum_expected: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.backup_boot_checksum_expected);
+        append_string(buffer, buffer_len, &pos, "\nbackup_boot_checksum_stored: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.backup_boot_checksum_stored);
+        append_string(buffer, buffer_len, &pos, "\nbackup_boot_checksum_present: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.backup_boot_checksum_present);
+        append_string(buffer, buffer_len, &pos, "\nbackup_boot_checksum_valid: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.backup_boot_checksum_valid);
         append_string(buffer, buffer_len, &pos, "\nwrite_enabled: ");
         append_u64(buffer, buffer_len, &pos, mount->exfat.commit_ready);
         append_string(buffer, buffer_len, &pos, "\nwrite_policy: ");
         append_string(buffer, buffer_len, &pos, exfat_write_policy_string(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_candidate_ready: ");
+        append_u64(buffer, buffer_len, &pos, exfat_write_metadata_ready(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_policy_allows_commit: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.commit_ready);
+        append_string(buffer, buffer_len, &pos, "\nwrite_blocker: ");
+        append_string(buffer, buffer_len, &pos, exfat_write_blocker_string(mount));
+        append_string(buffer, buffer_len, &pos, "\nmanual_unlock_attempted: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.manual_unlock_attempted);
+        append_string(buffer, buffer_len, &pos, "\nmanual_unlock_ready: ");
+        append_u64(buffer, buffer_len, &pos, mount->exfat.manual_unlock_ready);
+        append_string(buffer, buffer_len, &pos, "\nmanual_unlock_blocker: ");
+        append_string(buffer, buffer_len, &pos, exfat_manual_unlock_blocker_string(mount));
+        append_string(buffer, buffer_len, &pos, "\nreal_write_prereq_ready: ");
+        append_u64(buffer, buffer_len, &pos, exfat_real_write_prereq_ready(mount));
+        append_string(buffer, buffer_len, &pos, "\nreal_write_blocker: ");
+        append_string(buffer, buffer_len, &pos, exfat_real_write_blocker_string(mount));
+        append_exfat_real_write_dry_run(mount, buffer, buffer_len, &pos);
+        append_string(buffer, buffer_len, &pos, "\nwrite_audit_volume_bounds: ");
+        append_u64(buffer, buffer_len, &pos, exfat_volume_bounds_valid(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_audit_fat_bounds: ");
+        append_u64(buffer, buffer_len, &pos, exfat_fat_bounds_valid(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_audit_heap_bounds: ");
+        append_u64(buffer, buffer_len, &pos, exfat_cluster_heap_bounds_valid(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_audit_root_bounds: ");
+        append_u64(buffer, buffer_len, &pos, exfat_root_dir_bounds_valid(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_audit_bitmap_bounds: ");
+        append_u64(buffer, buffer_len, &pos, exfat_bitmap_bounds_valid(mount));
+        append_string(buffer, buffer_len, &pos, "\nwrite_audit_upcase_bounds: ");
+        append_u64(buffer, buffer_len, &pos, exfat_upcase_bounds_valid(mount));
         append_string(buffer, buffer_len, &pos, "\nallocation_bitmap: ");
         append_string(buffer, buffer_len, &pos,
                       mount->exfat.allocation_bitmap_present ? "present" : "missing");
@@ -3209,7 +3697,6 @@ static uint64_t blockfs_read(const char *path, uint64_t offset,
                              void *buffer, uint64_t buffer_len, void *context) {
     struct blockfs_mount *mount = context;
     struct exfat_root_entry *entry;
-    char info[BLOCKFS_INFO_MAX];
     uint8_t sector[512];
 
     if (mount == 0 || buffer == 0) {
@@ -3217,8 +3704,8 @@ static uint64_t blockfs_read(const char *path, uint64_t offset,
     }
 
     if (chars_equal(path, "/info.txt")) {
-        uint64_t info_len = build_info(mount, info, sizeof(info));
-        return read_from_buffer(offset, buffer, buffer_len, info, info_len);
+        uint64_t info_len = build_info(mount, blockfs_info_buffer, sizeof(blockfs_info_buffer));
+        return read_from_buffer(offset, buffer, buffer_len, blockfs_info_buffer, info_len);
     }
 
     if (chars_equal(path, "/sector0.bin")) {
@@ -3282,13 +3769,12 @@ static int blockfs_list(const char *path, uint64_t index, struct vfs_dirent *out
 
 static uint64_t blockfs_size(const char *path, void *context) {
     struct blockfs_mount *mount = context;
-    char info[BLOCKFS_INFO_MAX];
 
     if (mount == 0) {
         return (uint64_t)-1;
     }
     if (chars_equal(path, "/info.txt")) {
-        return build_info(mount, info, sizeof(info));
+        return build_info(mount, blockfs_info_buffer, sizeof(blockfs_info_buffer));
     }
     if (chars_equal(path, "/sector0.bin")) {
         return 512;
@@ -3440,6 +3926,131 @@ static int blockfs_unlink(const char *path, void *context) {
     return unlink_exfat_test_file_for_test(mount, path);
 }
 
+int blockfs_detect(uint64_t block_index) {
+    struct block_device_info block;
+    uint8_t sector[512];
+
+    if (block_get_info(block_index, &block) != 0 || block.block_size != 512) {
+        return BLOCKFS_DETECT_NONE;
+    }
+    if (block_read(block_index, 0, 1, sector) != 0 ||
+        sector[510] != 0x55 || sector[511] != 0xaa) {
+        return BLOCKFS_DETECT_NONE;
+    }
+    if (bytes_equal(sector + 3, "EXFAT   ", 8)) {
+        return BLOCKFS_DETECT_EXFAT;
+    }
+    if (bytes_equal(sector + 82, "FAT32   ", 8)) {
+        return BLOCKFS_DETECT_FAT32;
+    }
+    return BLOCKFS_DETECT_NONE;
+}
+
+int blockfs_request_write_unlock(const char *mount_path,
+                                 const struct blockfs_unlock_request *request) {
+    struct blockfs_mount *mount;
+    uint64_t usb_parent_index = 0;
+    int parent_was_writable;
+    int partition_was_writable;
+
+    mount = find_blockfs_mount_by_path(mount_path);
+    if (mount == 0 || request == 0) {
+        return -1;
+    }
+
+    mount->exfat.manual_unlock_attempted = 1;
+    mount->exfat.manual_unlock_ready = 0;
+    mount->exfat.manual_unlock_armed = 0;
+    set_exfat_manual_unlock_blocker(mount, "checking");
+
+    if (request->magic != BLOCKFS_UNLOCK_MAGIC) {
+        set_exfat_manual_unlock_blocker(mount, "bad_magic");
+        return -1;
+    }
+    if (request->flags != 0) {
+        set_exfat_manual_unlock_blocker(mount, "unsupported_flags");
+        return -1;
+    }
+    if (!mount->exfat.present) {
+        set_exfat_manual_unlock_blocker(mount, "not_exfat");
+        return -1;
+    }
+    if (!chars_starts_with(mount->source, "usb0p")) {
+        set_exfat_manual_unlock_blocker(mount, "not_usb_partition");
+        return -1;
+    }
+    if (!exfat_real_write_dry_run_ready(mount)) {
+        set_exfat_manual_unlock_blocker(mount, exfat_real_write_blocker_string(mount));
+        return -1;
+    }
+    if (request->expected_bitmap_lba != mount->exfat.transaction_bitmap_lba ||
+        request->expected_fat_lba != mount->exfat.transaction_fat_lba ||
+        request->expected_directory_lba != mount->exfat.transaction_directory_lba) {
+        set_exfat_manual_unlock_blocker(mount, "dry_run_lba_mismatch");
+        return -1;
+    }
+    if (block_find_by_name("usb0", &usb_parent_index) != 0) {
+        set_exfat_manual_unlock_blocker(mount, "usb0_missing");
+        return -1;
+    }
+
+    parent_was_writable = mount->block.writable;
+    partition_was_writable = mount->block.writable;
+    {
+        struct block_device_info parent_info;
+        if (block_get_info(usb_parent_index, &parent_info) == 0) {
+            parent_was_writable = parent_info.writable;
+        }
+    }
+
+    if (block_set_writable(usb_parent_index, 1) != 0) {
+        set_exfat_manual_unlock_blocker(mount, "usb0_write_enable_failed");
+        return -1;
+    }
+    if (block_set_writable(mount->block_index, 1) != 0 ||
+        block_get_info(mount->block_index, &mount->block) != 0 ||
+        !mount->block.writable) {
+        if (!parent_was_writable) {
+            (void)block_set_writable(usb_parent_index, 0);
+        }
+        set_exfat_manual_unlock_blocker(mount, "partition_write_enable_failed");
+        return -1;
+    }
+
+    mount->exfat.manual_unlock_armed = 1;
+    commit_exfat_create_transaction_for_test(mount);
+    mount->exfat.manual_unlock_armed = 0;
+
+    if (!mount->exfat.commit_ready || !mount->exfat.commit_verified) {
+        if (!partition_was_writable) {
+            (void)block_set_writable(mount->block_index, 0);
+        }
+        if (!parent_was_writable) {
+            (void)block_set_writable(usb_parent_index, 0);
+        }
+        (void)block_get_info(mount->block_index, &mount->block);
+        set_exfat_manual_unlock_blocker(mount, "commit_failed");
+        return -1;
+    }
+
+    mark_exfat_writable_root_entries_for_test(mount);
+    if (vfs_update_mount_write_handlers(mount, blockfs_write,
+                                        blockfs_truncate,
+                                        blockfs_unlink) != 0) {
+        mount->exfat.manual_unlock_ready = 0;
+        set_exfat_manual_unlock_blocker(mount, "vfs_update_failed");
+        return -1;
+    }
+
+    mount->exfat.manual_unlock_ready = 1;
+    set_exfat_manual_unlock_blocker(mount, "none");
+    log_info("exFAT manual write unlock verified: source=%s path=%s writes=%u\n",
+             mount->source,
+             mount->mount_path,
+             mount->exfat.commit_write_count);
+    return 0;
+}
+
 int blockfs_mount(uint64_t block_index, const char *mount_path) {
     struct blockfs_mount *mount = 0;
     uint8_t sector[512];
@@ -3463,6 +4074,7 @@ int blockfs_mount(uint64_t block_index, const char *mount_path) {
 
     mount->in_use = 1;
     mount->block_index = block_index;
+    copy_limited(mount->mount_path, sizeof(mount->mount_path), mount_path);
     copy_limited(mount->source, sizeof(mount->source), mount->block.name);
     zero_bytes(&mount->exfat, sizeof(mount->exfat));
     zero_bytes(&mount->fat32, sizeof(mount->fat32));
@@ -3479,6 +4091,7 @@ int blockfs_mount(uint64_t block_index, const char *mount_path) {
                      mount->exfat.cluster_heap_offset,
                      mount->exfat.cluster_count,
                      mount->exfat.root_dir_cluster);
+            analyze_exfat_boot_regions(mount);
             parse_exfat_root_directory(mount);
         }
         if (!mount->exfat.present) {

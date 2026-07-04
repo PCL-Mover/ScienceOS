@@ -22,6 +22,35 @@ sub write_at {
     print {$fh} $data;
 }
 sub lba_offset { return ($_[0] * $sector_size); }
+sub exfat_boot_checksum_step {
+    my ($checksum, $byte) = @_;
+    return (((($checksum & 1) != 0) ? 0x80000000 : 0) +
+            (($checksum >> 1) & 0x7fffffff) +
+            $byte) & 0xffffffff;
+}
+sub exfat_boot_checksum {
+    my ($region) = @_;
+    my $checksum = 0;
+    for my $i (0 .. (11 * $sector_size) - 1) {
+        next if $i == 106 || $i == 107 || $i == 112;
+        $checksum = exfat_boot_checksum_step($checksum, ord(substr($region, $i, 1)));
+    }
+    return $checksum;
+}
+sub exfat_checksum_sector {
+    my ($checksum) = @_;
+    return le32($checksum) x int($sector_size / 4);
+}
+sub exfat_boot_region {
+    my ($boot_sector) = @_;
+    my $region = $boot_sector . ("\0" x (10 * $sector_size)) . ("\0" x $sector_size);
+    for my $sector (1 .. 8) {
+        substr($region, $sector * $sector_size + 508, 4, "\0\0\x55\xaa");
+    }
+    my $checksum = exfat_boot_checksum($region);
+    substr($region, 11 * $sector_size, $sector_size, exfat_checksum_sector($checksum));
+    return $region;
+}
 sub short_entry {
     my ($name, $attr, $cluster, $size) = @_;
     my $entry = "\0" x 32;
@@ -91,7 +120,9 @@ substr($exfat, 100, 4, "SOPT");
 substr($exfat, 104, 2, le16(0x0100));
 substr($exfat, 108, 5, "\x09\x03\x01\x80\x00");
 substr($exfat, 510, 2, "\x55\xaa");
-write_at($fh, lba_offset($exfat_start), $exfat);
+my $exfat_boot_region = exfat_boot_region($exfat);
+write_at($fh, lba_offset($exfat_start), $exfat_boot_region);
+write_at($fh, lba_offset($exfat_start + 12), $exfat_boot_region);
 
 my $exfat_base = lba_offset($exfat_start);
 write_at($fh, $exfat_base + 128 * $sector_size + 8, le32(8));

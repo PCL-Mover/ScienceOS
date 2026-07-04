@@ -26,6 +26,9 @@
 #define SYS_BLOCK_READ 23
 #define SYS_BLOCK_WRITE 24
 #define SYS_MOUNT_INFO 25
+#define SYS_BLOCKFS_UNLOCK 26
+
+#define BLOCKFS_UNLOCK_MAGIC 0x5450555342575249ULL
 
 #define STDIN_FD 0
 #define STDOUT_FD 1
@@ -110,6 +113,10 @@ struct system_info {
     uint64_t xhci_op_usbsts_before;
     uint64_t xhci_op_pagesize;
     uint64_t xhci_reset_allowed;
+    uint64_t xhci_reset_policy;
+    uint64_t xhci_real_hw_attempted;
+    uint64_t xhci_handoff_required;
+    uint64_t xhci_controller_start_result;
     uint64_t xhci_reset_attempted;
     uint64_t xhci_reset_ok;
     uint64_t xhci_halt_ok;
@@ -154,6 +161,9 @@ struct system_info {
     uint64_t xhci_erdp_after_command;
     uint64_t xhci_port_scan_done;
     uint64_t xhci_port_scan_limit;
+    uint64_t xhci_port_power_attempted;
+    uint64_t xhci_port_power_changed_count;
+    uint64_t xhci_port_connect_rescan_count;
     uint64_t xhci_connected_port_count;
     uint64_t xhci_enabled_port_count;
     uint64_t xhci_powered_port_count;
@@ -169,6 +179,13 @@ struct system_info {
     uint64_t xhci_second_connected_enabled;
     uint64_t xhci_second_connected_powered;
     uint64_t xhci_second_connected_link_state;
+    uint64_t xhci_selected_connected_port;
+    uint64_t xhci_selected_connected_portsc;
+    uint64_t xhci_selected_connected_speed;
+    uint64_t xhci_selected_connected_enabled;
+    uint64_t xhci_selected_connected_powered;
+    uint64_t xhci_selected_connected_link_state;
+    uint64_t xhci_selected_connected_score;
     uint64_t xhci_port1_portsc;
     uint64_t xhci_port_reset_attempted;
     uint64_t xhci_port_reset_ok;
@@ -258,6 +275,30 @@ struct system_info {
     uint64_t xhci_first_bulk_out_interval;
     uint64_t xhci_first_bulk_in_dci;
     uint64_t xhci_first_bulk_out_dci;
+    uint64_t xhci_hub_detected;
+    uint64_t xhci_hub_configuration_attempted;
+    uint64_t xhci_hub_configuration_ok;
+    uint64_t xhci_hub_configuration_completion_code;
+    uint64_t xhci_hub_descriptor_attempted;
+    uint64_t xhci_hub_descriptor_ok;
+    uint64_t xhci_hub_descriptor_completion_code;
+    uint64_t xhci_hub_descriptor_phys;
+    uint64_t xhci_hub_descriptor_length;
+    uint64_t xhci_hub_descriptor_type;
+    uint64_t xhci_hub_port_count;
+    uint64_t xhci_hub_characteristics;
+    uint64_t xhci_hub_power_on_to_power_good;
+    uint64_t xhci_hub_port_power_attempted;
+    uint64_t xhci_hub_port_power_ok_count;
+    uint64_t xhci_hub_port_status_attempted;
+    uint64_t xhci_hub_first_connected_port;
+    uint64_t xhci_hub_first_port_status;
+    uint64_t xhci_hub_first_port_change;
+    uint64_t xhci_hub_port_reset_attempted;
+    uint64_t xhci_hub_port_reset_ok;
+    uint64_t xhci_hub_port_reset_port;
+    uint64_t xhci_hub_port_reset_status;
+    uint64_t xhci_hub_port_reset_change;
     uint64_t xhci_configure_endpoint_attempted;
     uint64_t xhci_configure_endpoint_ok;
     uint64_t xhci_configure_endpoint_completion_code;
@@ -317,6 +358,8 @@ struct system_info {
     uint64_t xhci_bot_csw_tag;
     uint64_t xhci_bot_csw_residue;
     uint64_t xhci_bot_csw_status;
+    uint64_t xhci_bot_last_error_stage;
+    uint64_t xhci_usb_storage_readonly_policy;
     uint64_t xhci_inquiry_peripheral;
     uint64_t xhci_inquiry_removable;
     uint64_t xhci_inquiry_version;
@@ -388,6 +431,14 @@ struct mount_info {
     uint64_t writable;
 };
 
+struct blockfs_unlock_request {
+    uint64_t magic;
+    uint64_t expected_bitmap_lba;
+    uint64_t expected_fat_lba;
+    uint64_t expected_directory_lba;
+    uint64_t flags;
+};
+
 uint64_t tpos_syscall2(uint64_t number, uint64_t arg0, uint64_t arg1);
 uint64_t tpos_syscall3(uint64_t number, uint64_t arg0, uint64_t arg1, uint64_t arg2);
 uint64_t tpos_syscall4(uint64_t number, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3);
@@ -416,6 +467,8 @@ uint64_t tpos_block_info(uint64_t index, struct block_device_info *info);
 uint64_t tpos_block_read(uint64_t index, uint64_t lba, void *buffer, uint64_t count);
 uint64_t tpos_block_write(uint64_t index, uint64_t lba, const void *buffer, uint64_t count);
 uint64_t tpos_mount_info(uint64_t index, struct mount_info *info);
+uint64_t tpos_blockfs_unlock(const char *mount_path,
+                             const struct blockfs_unlock_request *request);
 __attribute__((noreturn)) void tpos_exit(uint64_t status);
 
 uint64_t tpos_strlen(const char *s);

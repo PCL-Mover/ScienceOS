@@ -1,4 +1,5 @@
 #include <block.h>
+#include <blockfs.h>
 #include <console.h>
 #include <log.h>
 #include <scheduler.h>
@@ -35,6 +36,7 @@
 #define SYSCALL_BLOCK_READ 23
 #define SYSCALL_BLOCK_WRITE 24
 #define SYSCALL_MOUNT_INFO 25
+#define SYSCALL_BLOCKFS_UNLOCK 26
 #define SYSCALL_WRITE_CHUNK_SIZE 128
 #define SYSCALL_PATH_MAX 128
 #define SYSCALL_READ_CHUNK_SIZE 512
@@ -358,6 +360,25 @@ static uint64_t syscall_mount_info(uint64_t index, void *buffer, uint64_t len) {
     return copy_to_user(buffer, &info, sizeof(info)) == 0 ? 0 : (uint64_t)-1;
 }
 
+static uint64_t syscall_blockfs_unlock(const char *path, const void *buffer,
+                                       uint64_t len) {
+    char kernel_path[SYSCALL_PATH_MAX];
+    struct blockfs_unlock_request request;
+
+    if (len < sizeof(request)) {
+        return (uint64_t)-1;
+    }
+    if (copy_string_from_user(kernel_path, path, sizeof(kernel_path)) != 0 ||
+        usercopy_validate_range(buffer, sizeof(request), 0) != 0 ||
+        copy_from_user(&request, buffer, sizeof(request)) != 0) {
+        return (uint64_t)-1;
+    }
+
+    return blockfs_request_write_unlock(kernel_path, &request) == 0
+        ? 0
+        : (uint64_t)-1;
+}
+
 struct interrupt_frame *syscall_dispatch(struct interrupt_frame *frame) {
     static int reported_user_entry;
 
@@ -464,6 +485,13 @@ struct interrupt_frame *syscall_dispatch(struct interrupt_frame *frame) {
             break;
         case SYSCALL_MOUNT_INFO:
             frame->rax = syscall_mount_info(frame->rdi, (void *)frame->rsi, frame->rdx);
+            break;
+        case SYSCALL_BLOCKFS_UNLOCK:
+            frame->rax = syscall_blockfs_unlock(
+                (const char *)frame->rdi,
+                (const void *)frame->rsi,
+                frame->rdx
+            );
             break;
         default:
             log_warn("unknown syscall: %u\n", frame->rax);

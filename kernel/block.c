@@ -163,6 +163,21 @@ int block_write(uint64_t index, uint64_t lba, uint64_t count, const void *buffer
     return device->write(device, lba, count, buffer);
 }
 
+int block_set_writable(uint64_t index, uint64_t writable) {
+    if (index >= device_count) {
+        return -1;
+    }
+
+    struct block_device *device = devices[index];
+    if (writable != 0 && device->write == 0) {
+        return -1;
+    }
+    device->writable = writable == 0 ? 0 : 1;
+    log_info("block device writable changed: %s writable=%u\n",
+             device->name, device->writable);
+    return 0;
+}
+
 void block_init(void) {
     static const char label[] = "TangPingOS ram block device\n";
 
