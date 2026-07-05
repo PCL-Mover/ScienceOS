@@ -227,6 +227,9 @@ void sysinfo_get_system_info(struct sys_system_info *out) {
     out->xhci_port_reset_enabled = xhci.port_reset_enabled;
     out->xhci_port_reset_speed = xhci.port_reset_speed;
     out->xhci_port_reset_link_state = xhci.port_reset_link_state;
+    out->xhci_port_warm_reset_attempted = xhci.port_warm_reset_attempted;
+    out->xhci_port_warm_reset_ok = xhci.port_warm_reset_ok;
+    out->xhci_port_warm_reset_portsc_after = xhci.port_warm_reset_portsc_after;
     out->xhci_address_device_attempted = xhci.address_device_attempted;
     out->xhci_address_device_ok = xhci.address_device_ok;
     out->xhci_address_device_completion_code = xhci.address_device_completion_code;

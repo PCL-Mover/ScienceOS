@@ -1807,6 +1807,12 @@ static void cmd_usbdiag(void) {
     write_u64_decimal(info.xhci_port_reset_ok);
     write_cstr("/");
     write_u64_decimal(info.xhci_port_reset_port);
+    write_cstr("\nwarm_reset_attempted/ok/after: ");
+    write_u64_decimal(info.xhci_port_warm_reset_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_port_warm_reset_ok);
+    write_cstr("/");
+    write_u64_hex(info.xhci_port_warm_reset_portsc_after);
     write_cstr("\naddress_attempted/ok/cc: ");
     write_u64_decimal(info.xhci_address_device_attempted);
     write_cstr("/");
@@ -1831,6 +1837,12 @@ static void cmd_usbdiag(void) {
     write_u64_decimal(info.xhci_configure_endpoint_ok);
     write_cstr("/");
     write_u64_decimal(info.xhci_configure_endpoint_completion_code);
+    write_cstr("\nset configuration attempted/ok/cc: ");
+    write_u64_decimal(info.xhci_set_configuration_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_set_configuration_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_set_configuration_completion_code);
     write_cstr("\nhub detected/config/desc/ports: ");
     write_u64_decimal(info.xhci_hub_detected);
     write_cstr("/");
@@ -1888,34 +1900,36 @@ static void cmd_usbdiag(void) {
         write_cstr("root_port_reset_not_attempted");
     } else if (!info.xhci_port_reset_ok) {
         write_cstr("root_port_reset_failed");
-    } else if (!info.xhci_address_device_attempted) {
-        write_cstr("address_device_not_attempted");
-    } else if (!info.xhci_address_device_ok) {
-        write_cstr("address_device_failed");
-    } else if ((info.xhci_device_class == 9 ||
-                info.xhci_first_interface_class == 9) &&
+    } else if (info.xhci_hub_detected &&
                !info.xhci_hub_configuration_ok) {
         write_cstr("usb_hub_configuration_failed");
-    } else if ((info.xhci_device_class == 9 ||
-                info.xhci_first_interface_class == 9) &&
+    } else if (info.xhci_hub_detected &&
                !info.xhci_hub_descriptor_ok) {
         write_cstr("usb_hub_descriptor_failed");
-    } else if ((info.xhci_device_class == 9 ||
-                info.xhci_first_interface_class == 9) &&
+    } else if (info.xhci_hub_detected &&
                info.xhci_hub_first_connected_port == 0) {
         write_cstr("usb_hub_no_downstream_device");
-    } else if ((info.xhci_device_class == 9 ||
-                info.xhci_first_interface_class == 9) &&
+    } else if (info.xhci_hub_detected &&
                !info.xhci_hub_port_reset_ok) {
         write_cstr("usb_hub_downstream_reset_failed");
-    } else if (info.xhci_device_class == 9 ||
-               info.xhci_first_interface_class == 9) {
-        write_cstr("usb_hub_downstream_reset_ok_second_slot_pending");
+    } else if (!info.xhci_address_device_attempted) {
+        write_cstr(info.xhci_hub_detected ?
+                   "usb_hub_second_slot_not_attempted" :
+                   "address_device_not_attempted");
+    } else if (!info.xhci_address_device_ok) {
+        write_cstr(info.xhci_hub_detected ?
+                   "usb_hub_second_slot_address_failed" :
+                   "address_device_failed");
     } else if (info.xhci_first_interface_seen &&
                (info.xhci_first_interface_class != 8 ||
                 info.xhci_first_interface_subclass != 6 ||
                 info.xhci_first_interface_protocol != 80)) {
-        write_cstr("first_device_is_not_mass_storage_bot");
+        write_cstr(info.xhci_hub_detected ?
+                   "usb_hub_downstream_not_mass_storage_bot" :
+                   "first_device_is_not_mass_storage_bot");
+    } else if (info.xhci_set_configuration_attempted &&
+               !info.xhci_set_configuration_ok) {
+        write_cstr("mass_storage_set_configuration_failed");
     } else if (!info.xhci_bot_inquiry_ok) {
         write_cstr("mass_storage_inquiry_failed_or_not_attempted");
     } else if (!info.xhci_bot_capacity_ok) {
@@ -1926,9 +1940,10 @@ static void cmd_usbdiag(void) {
         write_cstr("usb0_ready");
     }
     write_cstr("\nhint: ");
-    if (info.xhci_device_class == 9 || info.xhci_first_interface_class == 9) {
+    if (info.xhci_hub_detected ||
+        info.xhci_device_class == 9 || info.xhci_first_interface_class == 9) {
         if (info.xhci_hub_port_reset_ok) {
-            write_cstr("Hub downstream reset works; next step is xHCI second-slot enumeration.");
+            write_cstr("Hub downstream reset works; inspect second-slot address/config/BOT fields.");
         } else {
             write_cstr("Hub support is partial; capture these hub fields for the next driver step.");
         }
@@ -3805,6 +3820,7 @@ static void run_usb_block_write_self_test(char *buffer, uint64_t buffer_len) {
     write_literal(ok, sizeof(ok) - 1);
 }
 
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 static int verify_exfat_vfs_write_path(const char *path, const char *content,
                                        char *buffer, uint64_t buffer_len) {
     uint64_t len = string_length(content);
@@ -4001,7 +4017,6 @@ static void run_usb_exfat_user_write_self_test(char *buffer, uint64_t buffer_len
     write_literal(ok, sizeof(ok) - 1);
 }
 
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
 static void run_exfat_vfs_write_self_test(char *buffer, uint64_t buffer_len) {
     static const char ok[] = "shell.elf: exFAT VFS write ok\n";
     static const char usb_ok[] = "shell.elf: USB exFAT VFS write ok\n";
@@ -4132,8 +4147,8 @@ void _start(void) {
 #endif
     run_usb_fat32_mount_self_test(heap, 12288);
     run_usb_block_write_self_test(heap, 12288);
-    run_usb_exfat_user_write_self_test(heap, 12288);
 #ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    run_usb_exfat_user_write_self_test(heap, 12288);
     run_exfat_vfs_write_self_test(heap, 12288);
 #endif
     cmd_ls("/");

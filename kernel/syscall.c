@@ -38,6 +38,8 @@
 #define SYSCALL_MOUNT_INFO 25
 #define SYSCALL_BLOCKFS_UNLOCK 26
 #define SYSCALL_WRITE_CHUNK_SIZE 128
+
+static struct sys_system_info syscall_sysinfo_scratch;
 #define SYSCALL_PATH_MAX 128
 #define SYSCALL_READ_CHUNK_SIZE 512
 #define SYSCALL_BLOCK_MAX_COUNT 8
@@ -280,14 +282,15 @@ static uint64_t syscall_meminfo(void *buffer, uint64_t len) {
 }
 
 static uint64_t syscall_sysinfo(void *buffer, uint64_t len) {
-    struct sys_system_info info;
-
-    if (len < sizeof(info) || usercopy_validate_range(buffer, sizeof(info), 1) != 0) {
+    if (len < sizeof(syscall_sysinfo_scratch) ||
+        usercopy_validate_range(buffer, sizeof(syscall_sysinfo_scratch), 1) != 0) {
         return (uint64_t)-1;
     }
 
-    sysinfo_get_system_info(&info);
-    return copy_to_user(buffer, &info, sizeof(info)) == 0 ? 0 : (uint64_t)-1;
+    sysinfo_get_system_info(&syscall_sysinfo_scratch);
+    return copy_to_user(buffer,
+                        &syscall_sysinfo_scratch,
+                        sizeof(syscall_sysinfo_scratch)) == 0 ? 0 : (uint64_t)-1;
 }
 
 static uint64_t syscall_block_info(uint64_t index, void *buffer, uint64_t len) {

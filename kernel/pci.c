@@ -78,12 +78,18 @@
 #define XHCI_PORTSC_PP  (1U << 9)
 #define XHCI_PORTSC_PLS_SHIFT 5ULL
 #define XHCI_PORTSC_PLS_MASK (0xfU << XHCI_PORTSC_PLS_SHIFT)
+#define XHCI_PORTSC_LINK_U0 0U
+#define XHCI_PORTSC_LINK_DISABLED 4U
+#define XHCI_PORTSC_LINK_RX_DETECT 5U
+#define XHCI_PORTSC_LINK_INACTIVE 6U
+#define XHCI_PORTSC_LINK_POLLING 7U
+#define XHCI_PORTSC_LINK_COMPLIANCE 10U
 #define XHCI_PORTSC_SPEED_SHIFT 10ULL
 #define XHCI_PORTSC_SPEED_MASK (0xfU << XHCI_PORTSC_SPEED_SHIFT)
+#define XHCI_PORTSC_WPR (1U << 31)
 #define XHCI_PORTSC_CHANGE_MASK ((1U << 17) | (1U << 18) | (1U << 19) | (1U << 20) | \
                                  (1U << 21) | (1U << 22) | (1U << 23) | (1U << 24) | \
-                                 (1U << 25) | (1U << 26) | (1U << 27) | (1U << 30) | \
-                                 (1U << 31))
+                                 (1U << 25) | (1U << 26) | (1U << 27) | (1U << 30))
 #define USB_DESCRIPTOR_TYPE_CONFIGURATION 2ULL
 #define USB_DESCRIPTOR_TYPE_INTERFACE 4ULL
 #define USB_DESCRIPTOR_TYPE_ENDPOINT 5ULL
@@ -325,6 +331,55 @@ static uint64_t xhci_port_selection_score(uint64_t speed,
     }
 
     return score;
+}
+
+static uint32_t xhci_portsc_neutral_write_value(uint32_t portsc) {
+    uint32_t value = 0;
+
+    if ((portsc & XHCI_PORTSC_PP) != 0) {
+        value |= XHCI_PORTSC_PP;
+    }
+    return value;
+}
+
+static uint32_t xhci_portsc_with_change_clear(uint32_t portsc) {
+    return xhci_portsc_neutral_write_value(portsc) |
+           (portsc & XHCI_PORTSC_CHANGE_MASK);
+}
+
+static void xhci_clear_root_port_changes(volatile uint8_t *op,
+                                         uint64_t offset) {
+    uint32_t portsc = mmio_read32(op, offset);
+
+    if ((portsc & XHCI_PORTSC_CHANGE_MASK) != 0) {
+        mmio_write32(op, offset, xhci_portsc_with_change_clear(portsc));
+    }
+}
+
+static int xhci_port_reset_succeeded(uint32_t portsc) {
+    return (portsc & XHCI_PORTSC_PR) == 0 &&
+           (portsc & XHCI_PORTSC_WPR) == 0 &&
+           (portsc & XHCI_PORTSC_CCS) != 0 &&
+           (portsc & XHCI_PORTSC_PED) != 0;
+}
+
+static int xhci_port_needs_warm_reset(uint32_t before, uint32_t after) {
+    uint64_t before_speed = (before & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
+    uint64_t before_link = (before & XHCI_PORTSC_PLS_MASK) >> XHCI_PORTSC_PLS_SHIFT;
+    uint64_t after_link = (after & XHCI_PORTSC_PLS_MASK) >> XHCI_PORTSC_PLS_SHIFT;
+
+    if ((before & XHCI_PORTSC_CCS) == 0) {
+        return 0;
+    }
+    if (before_speed >= 3) {
+        return 1;
+    }
+    return before_link == XHCI_PORTSC_LINK_POLLING ||
+           before_link == XHCI_PORTSC_LINK_COMPLIANCE ||
+           before_link == XHCI_PORTSC_LINK_INACTIVE ||
+           after_link == XHCI_PORTSC_LINK_POLLING ||
+           after_link == XHCI_PORTSC_LINK_COMPLIANCE ||
+           after_link == XHCI_PORTSC_LINK_INACTIVE;
 }
 
 static void xhci_port_delay(void) {
@@ -1516,7 +1571,7 @@ static void xhci_power_root_ports(volatile uint8_t *regs) {
             continue;
         }
 
-        mmio_write32(op, offset, (portsc & ~XHCI_PORTSC_CHANGE_MASK) | XHCI_PORTSC_PP);
+        mmio_write32(op, offset, xhci_portsc_neutral_write_value(portsc) | XHCI_PORTSC_PP);
         xhci_info.port_power_changed_count++;
     }
 
@@ -1541,6 +1596,7 @@ static void xhci_reset_root_port(volatile uint8_t *regs, uint64_t port) {
     uint64_t offset;
     uint32_t before;
     uint32_t after = 0;
+    uint32_t warm_after = 0;
 
     if (regs == 0 || !xhci_info.reset_allowed || !xhci_info.controller_started) {
         return;
@@ -1564,7 +1620,14 @@ static void xhci_reset_root_port(volatile uint8_t *regs, uint64_t port) {
     xhci_info.port_reset_enabled = 0;
     xhci_info.port_reset_speed = 0;
     xhci_info.port_reset_link_state = 0;
-    mmio_write32(op, offset, (before & ~XHCI_PORTSC_CHANGE_MASK) | XHCI_PORTSC_PR);
+    xhci_info.port_warm_reset_attempted = 0;
+    xhci_info.port_warm_reset_ok = 0;
+    xhci_info.port_warm_reset_portsc_after = 0;
+
+    xhci_clear_root_port_changes(op, offset);
+    before = mmio_read32(op, offset);
+    xhci_info.port_reset_portsc_before = before;
+    mmio_write32(op, offset, xhci_portsc_neutral_write_value(before) | XHCI_PORTSC_PR);
 
     for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
         after = mmio_read32(op, offset);
@@ -1573,15 +1636,37 @@ static void xhci_reset_root_port(volatile uint8_t *regs, uint64_t port) {
         }
     }
 
+    if (!xhci_port_reset_succeeded(after) &&
+        xhci_port_needs_warm_reset(before, after)) {
+        xhci_clear_root_port_changes(op, offset);
+        xhci_info.port_warm_reset_attempted = 1;
+        mmio_write32(op, offset,
+                     xhci_portsc_neutral_write_value(mmio_read32(op, offset)) |
+                         XHCI_PORTSC_WPR);
+        for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
+            warm_after = mmio_read32(op, offset);
+            if ((warm_after & XHCI_PORTSC_WPR) == 0 &&
+                (warm_after & XHCI_PORTSC_PR) == 0) {
+                break;
+            }
+        }
+        xhci_port_delay();
+        warm_after = mmio_read32(op, offset);
+        xhci_info.port_warm_reset_portsc_after = warm_after;
+        if (xhci_port_reset_succeeded(warm_after)) {
+            xhci_info.port_warm_reset_ok = 1;
+        }
+        after = warm_after;
+    }
+
     xhci_info.port_reset_portsc_after = after;
     xhci_info.port_reset_enabled = (after & XHCI_PORTSC_PED) ? 1 : 0;
     xhci_info.port_reset_speed = (after & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
     xhci_info.port_reset_link_state = (after & XHCI_PORTSC_PLS_MASK) >> XHCI_PORTSC_PLS_SHIFT;
-    if ((after & XHCI_PORTSC_PR) == 0 &&
-        (after & XHCI_PORTSC_CCS) != 0 &&
-        (after & XHCI_PORTSC_PED) != 0) {
+    if (xhci_port_reset_succeeded(after)) {
         xhci_info.port_reset_ok = 1;
     }
+    xhci_clear_root_port_changes(op, offset);
 }
 
 static void xhci_address_device(volatile uint8_t *regs,
@@ -2869,10 +2954,57 @@ static int xhci_probe_root_port_device(volatile uint8_t *regs,
     return (xhci_info.bot_capacity_ok && xhci_info.bot_read10_ok) ? 0 : -1;
 }
 
+static int xhci_probe_has_meaningful_device_state(void) {
+    if (xhci_info.bot_inquiry_attempted ||
+        xhci_info.bot_capacity_attempted ||
+        xhci_info.bot_read10_attempted) {
+        return 1;
+    }
+    if (xhci_info.first_interface_class == 8 &&
+        xhci_info.first_interface_subclass == 6 &&
+        xhci_info.first_interface_protocol == 80) {
+        return 1;
+    }
+    if (xhci_info.hub_port_reset_ok ||
+        (xhci_info.hub_detected && xhci_info.hub_first_connected_port != 0)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int xhci_try_connected_root_port(volatile uint8_t *regs,
+                                        volatile uint8_t *op,
+                                        uint64_t port,
+                                        int *use_existing_slot) {
+    uint64_t offset;
+    uint32_t portsc;
+
+    if (regs == 0 || op == 0 || use_existing_slot == 0 || port == 0) {
+        return 0;
+    }
+
+    offset = XHCI_PORT_REGS_BASE + (port - 1) * XHCI_PORT_REG_STRIDE;
+    if (offset + 4 > XHCI_MMIO_MAP_BYTES) {
+        return 0;
+    }
+
+    portsc = mmio_read32(op, offset);
+    if ((portsc & XHCI_PORTSC_CCS) == 0) {
+        return 0;
+    }
+
+    if (xhci_probe_root_port_device(regs, port, *use_existing_slot) == 0) {
+        return 1;
+    }
+    *use_existing_slot = 0;
+    return xhci_probe_has_meaningful_device_state();
+}
+
 static void xhci_probe_connected_root_ports(volatile uint8_t *regs) {
     volatile uint8_t *op;
     uint64_t limit;
     int use_existing_slot = 1;
+    uint64_t selected_port;
 
     if (regs == 0 || !xhci_info.op_regs_ready || xhci_info.cap_length == 0 ||
         !xhci_info.rings_ready || !xhci_info.controller_started) {
@@ -2885,22 +3017,19 @@ static void xhci_probe_connected_root_ports(volatile uint8_t *regs) {
         limit = 64;
     }
 
-    for (uint64_t port = 1; port <= limit; port++) {
-        uint64_t offset = XHCI_PORT_REGS_BASE + (port - 1) * XHCI_PORT_REG_STRIDE;
-        uint32_t portsc;
-        if (offset + 4 > XHCI_MMIO_MAP_BYTES) {
-            break;
-        }
+    selected_port = xhci_info.selected_connected_port;
+    if (selected_port != 0 && selected_port <= limit &&
+        xhci_try_connected_root_port(regs, op, selected_port, &use_existing_slot)) {
+        return;
+    }
 
-        portsc = mmio_read32(op, offset);
-        if ((portsc & XHCI_PORTSC_CCS) == 0) {
+    for (uint64_t port = 1; port <= limit; port++) {
+        if (port == selected_port) {
             continue;
         }
-
-        if (xhci_probe_root_port_device(regs, port, use_existing_slot) == 0) {
+        if (xhci_try_connected_root_port(regs, op, port, &use_existing_slot)) {
             return;
         }
-        use_existing_slot = 0;
     }
 }
 

@@ -70,6 +70,8 @@ CFLAGS := \
 	-O2 \
 	-Wall \
 	-Wextra \
+	-MMD \
+	-MP \
 	-Ikernel/include \
 	$(EXTRA_CFLAGS)
 
@@ -98,6 +100,8 @@ USER_CFLAGS := \
 	-O2 \
 	-Wall \
 	-Wextra \
+	-MMD \
+	-MP \
 	-Iuserspace/lib \
 	$(EXTRA_USER_CFLAGS)
 
@@ -298,3 +302,11 @@ check-uefi:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+-include $(KERNEL_C_OBJECTS:.o=.d)
+-include $(INIT_OBJECTS:.o=.d)
+-include $(USER_LIB_OBJECTS:.o=.d)
+-include $(SHELL_OBJECTS:.o=.d)
+-include $(HELLO_OBJECTS:.o=.d)
+-include $(LS_OBJECTS:.o=.d)
+-include $(CAT_OBJECTS:.o=.d)

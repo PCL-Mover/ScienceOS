@@ -124,6 +124,9 @@ struct pci_xhci_info {
     uint64_t port_reset_enabled;
     uint64_t port_reset_speed;
     uint64_t port_reset_link_state;
+    uint64_t port_warm_reset_attempted;
+    uint64_t port_warm_reset_ok;
+    uint64_t port_warm_reset_portsc_after;
     uint64_t address_device_attempted;
     uint64_t address_device_ok;
     uint64_t address_device_completion_code;

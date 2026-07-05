@@ -122,3 +122,5 @@
 - 2026-07-04: 将 Mass Storage 初始 INQUIRY/READ CAPACITY/READ10 切换为动态 bulk ring 提交并按 TRB 指针匹配完成事件。
 - 2026-07-04: xHCI 启动探测改为遍历所有已连接 root port，避免只尝试 hub 或单个端口而漏掉直插启动 U 盘。
 - 2026-07-04: 重排 USB Mass Storage 初始化顺序，先执行 SET_CONFIGURATION，再配置 bulk endpoint，并加入 BOT reset、clear-halt 与 INQUIRY 重试。
+- 2026-07-04: 修正 xHCI PORTSC neutral write 与 USB3 warm reset fallback，并让 root port 探测优先保留 Hub/Mass Storage 的有效失败现场。
+- 2026-07-05: 修复 sysinfo 系统调用占用过大内核栈导致的 page fault，并为构建系统加入头文件依赖，避免用户态 ABI 旧对象残留。

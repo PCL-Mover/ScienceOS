@@ -174,7 +174,7 @@ USB media is not automatically modified.
 | `uptime` | `uptime` | Prints scheduler ticks and whole seconds. |
 | `sysinfo` | `sysinfo` | Prints CPU, framebuffer, memmap, timer, uptime, memory summary, and xHCI count. |
 | `usb` | `usb` | Prints the first detected xHCI USB controller's PCI, MMIO, capability-register, operational-register/reset policy, real-hardware handoff/start result, extended-capability, BIOS/OS handoff, ring setup, first command result, root-hub port status including the first, second, and selected connected ports, QEMU port-reset information, first Address Device result, first device/configuration/interface descriptors, first bulk endpoint pair, Configure Endpoint result, Set Configuration result, and first USB Mass Storage BOT Inquiry/Read Capacity/Read10/Write10 results. |
-| `usbdiag` | `usbdiag` | Prints a compact USB bring-up diagnosis with root-port power/rescan counters, the selected root port, reset/address/BOT status, first-level USB hub configuration/port-reset status, whether `usb0` exists, and a short reason such as `no_connected_root_port`, `usb_hub_downstream_reset_ok_second_slot_pending`, `root_port_reset_failed`, or `usb0_ready`. |
+| `usbdiag` | `usbdiag` | Prints a compact USB bring-up diagnosis with root-port power/rescan counters, selected root port, normal/warm reset status, address/configuration/BOT status, first-level USB hub status, whether `usb0` exists, and a short reason such as `no_connected_root_port`, `usb_hub_second_slot_address_failed`, `mass_storage_inquiry_failed_or_not_attempted`, or `usb0_ready`. |
 | `mounts` | `mounts` | Lists VFS mount entries, sources, and writable status. |
 | `lsblk` | `lsblk` | Lists registered block devices. |
 | `blkread` | `blkread 2 0` | Reads one 512-byte sector and prints it in hexadecimal. After USB Mass Storage probing succeeds, `blkread <usb0-id> 0` can read the `usb0` device shown by `lsblk`. |
@@ -296,15 +296,14 @@ unknown real media until `writeunlock` is invoked explicitly and succeeds.
 
 TangPingOS can now recognize a first-level external USB hub, set its
 configuration, read the minimum hub descriptor header, power its downstream
-ports, find the first connected downstream port, and request a downstream port
-reset. It first requests the normal USB2 hub descriptor and then falls back to
-the SuperSpeed hub descriptor type if needed. This is still not full hub
-support: TangPingOS does not yet allocate a second xHCI slot for the device
-behind the hub, so `lsblk` still will not show `usb0` for a U disk plugged
-through a hub, and `/usbdisk` cannot be mounted through that path yet. When
-`usbdiag` reports `usb_hub_downstream_reset_ok_second_slot_pending`, the next
-driver step is downstream device enumeration behind the hub. Booting from a USB
-stick through UEFI also does not mean the kernel can keep using that stick:
+ports, find the first connected downstream port, request a downstream port
+reset, and attempt second-slot xHCI enumeration for the device behind that hub.
+It first requests the normal USB2 hub descriptor and then falls back to the
+SuperSpeed hub descriptor type if needed. This is still not full hub support:
+hub paths remain under active bring-up, and `usbdiag` should be used to see
+whether the current failure is root-port reset, hub reset, second-slot address,
+mass-storage configuration, or BOT/SCSI. Booting from a USB stick through UEFI
+also does not mean the kernel can keep using that stick:
 after boot, TangPingOS currently relies on its own xHCI/BOT path rather than
 UEFI disk services.
 When `usbdiag` reports `no_connected_root_port`, the controller has started but
