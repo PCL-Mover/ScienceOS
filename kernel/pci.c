@@ -29,10 +29,15 @@
 #define XHCI_USBSTS_HCH   (1U << 0)
 #define XHCI_USBSTS_CNR   (1U << 11)
 #define XHCI_CRCR_RCS     (1ULL << 0)
-#define XHCI_POLL_LIMIT 1000000ULL
-#define XHCI_BULK_EVENT_POLL_LIMIT 20000ULL
+#define XHCI_REGISTER_TIMEOUT_MS 1000ULL
+#define XHCI_COMMAND_TIMEOUT_MS 5000ULL
+#define XHCI_CONTROL_TRANSFER_TIMEOUT_MS 1000ULL
+#define XHCI_BULK_TRANSFER_TIMEOUT_MS 2000ULL
+#define XHCI_ROOT_PORT_RESET_TIMEOUT_MS 1000ULL
+#define XHCI_PROBE_TOTAL_TIMEOUT_MS 12000ULL
+#define XHCI_STORAGE_BOOT_TIMEOUT_MS 8000ULL
 #define XHCI_PORT_CONNECT_RESCAN_LIMIT 8ULL
-#define XHCI_PORT_CONNECT_RESCAN_DELAY 200000ULL
+#define XHCI_PORT_POLL_DELAY_MS 25ULL
 #define XHCI_EXT_CAP_USB_LEGACY 0x01
 #define XHCI_EXT_CAP_BIOS_OWNED (1U << 16)
 #define XHCI_EXT_CAP_OS_OWNED   (1U << 24)
@@ -62,6 +67,7 @@
 #define XHCI_LINK_TRB_TOGGLE_CYCLE (1ULL << 1)
 #define XHCI_COMPLETION_SUCCESS 1ULL
 #define XHCI_COMPLETION_SHORT_PACKET 13ULL
+#define XHCI_TRANSFER_EVENT_RESIDUAL_MASK 0x00ffffffU
 #define XHCI_EVENT_RING_SEGMENT_PAGES 4ULL
 #define XHCI_EVENT_RING_SEGMENT_TRBS ((XHCI_EVENT_RING_SEGMENT_PAGES * PAGE_SIZE) / XHCI_TRB_SIZE)
 #define XHCI_RUNTIME_IR0_OFFSET 0x20ULL
@@ -102,6 +108,13 @@
 #define XHCI_ENDPOINT_TYPE_BULK_OUT 2ULL
 #define XHCI_ENDPOINT_TYPE_BULK_IN 6ULL
 #define XHCI_ENDPOINT_TYPE_INTERRUPT_IN 7ULL
+#define XHCI_SLOT_CONTEXT_MTT (1U << 25)
+#define XHCI_SLOT_CONTEXT_HUB (1U << 26)
+#define XHCI_SLOT_CONTEXT_LAST_CTX_MASK (0x1fU << 27)
+#define XHCI_SLOT_CONTEXT_MAX_PORTS_MASK (0xffU << 24)
+#define XHCI_SLOT_CONTEXT_MAX_PORTS_SHIFT 24ULL
+#define XHCI_SLOT_CONTEXT_TT_THINK_TIME_MASK (0x3U << 16)
+#define XHCI_SLOT_CONTEXT_TT_THINK_TIME_SHIFT 16ULL
 #define USB_REQUEST_GET_STATUS 0ULL
 #define USB_REQUEST_CLEAR_FEATURE 1ULL
 #define USB_REQUEST_GET_DESCRIPTOR 6ULL
@@ -120,6 +133,8 @@
 #define USB_HUB_PORT_CHANGE_ENABLE 0x0002U
 #define USB_HUB_PORT_CHANGE_RESET 0x0010U
 #define USB_HUB_PORT_POLL_LIMIT 50ULL
+#define USB_HUB_STATUS_RETRIES 5ULL
+#define USB_HUB_DEBOUNCE_STABLE_MS 100ULL
 #define USB_BOT_CBW_SIGNATURE 0x43425355ULL
 #define USB_BOT_CSW_SIGNATURE 0x53425355ULL
 #define USB_BOT_CBW_TAG_INQUIRY 0x544f5031ULL
@@ -134,10 +149,6 @@
 #define USB_BOT_CSW_LENGTH 13ULL
 #define USB_BOT_RESET_REQUEST 0xffULL
 #define USB_FEATURE_ENDPOINT_HALT 0ULL
-#define XHCI_RESET_POLICY_BLOCKED 0ULL
-#define XHCI_RESET_POLICY_QEMU 1ULL
-#define XHCI_RESET_POLICY_REAL_HANDOFF_OK 2ULL
-#define XHCI_RESET_POLICY_REAL_NO_LEGACY_CAP 3ULL
 #define XHCI_START_RESULT_NOT_ATTEMPTED 0ULL
 #define XHCI_START_RESULT_STARTED 1ULL
 #define XHCI_START_RESULT_BLOCKED 2ULL
@@ -159,6 +170,13 @@ static struct pci_xhci_info xhci_info;
 static volatile uint8_t *xhci_regs;
 static uint64_t xhci_command_ring_next_trb;
 static uint64_t xhci_command_ring_cycle;
+static uint64_t xhci_event_ring_dequeue;
+static uint64_t xhci_event_ring_cycle;
+static uint64_t xhci_tsc_hz;
+static uint64_t xhci_probe_deadline;
+static uint64_t xhci_storage_boot_deadline;
+static int xhci_probe_budget_expired;
+static int xhci_storage_io_failed;
 static uint64_t xhci_ep0_next_trb;
 static uint64_t xhci_ep0_cycle;
 static uint64_t xhci_ep0_wraps;
@@ -195,6 +213,98 @@ static void copy_bytes(void *dst, const void *src, uint64_t len) {
     }
 }
 
+static void xhci_cpuid(uint32_t leaf, uint32_t subleaf,
+                       uint32_t *eax, uint32_t *ebx,
+                       uint32_t *ecx, uint32_t *edx) {
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+    uint32_t d;
+
+    __asm__ volatile("cpuid"
+                     : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(leaf), "c"(subleaf));
+    if (eax != 0) {
+        *eax = a;
+    }
+    if (ebx != 0) {
+        *ebx = b;
+    }
+    if (ecx != 0) {
+        *ecx = c;
+    }
+    if (edx != 0) {
+        *edx = d;
+    }
+}
+
+static uint64_t xhci_read_tsc(void) {
+    uint32_t low;
+    uint32_t high;
+
+    __asm__ volatile("lfence\n\trdtsc" : "=a"(low), "=d"(high) :: "memory");
+    return (uint64_t)low | ((uint64_t)high << 32);
+}
+
+static uint64_t xhci_get_tsc_hz(void) {
+    uint32_t max_leaf = 0;
+    uint32_t denominator = 0;
+    uint32_t numerator = 0;
+    uint32_t crystal_hz = 0;
+    uint32_t base_mhz = 0;
+
+    if (xhci_tsc_hz != 0) {
+        return xhci_tsc_hz;
+    }
+
+    xhci_cpuid(0, 0, &max_leaf, 0, 0, 0);
+    if (max_leaf >= 0x15U) {
+        xhci_cpuid(0x15U, 0, &denominator, &numerator, &crystal_hz, 0);
+        if (denominator != 0 && numerator != 0 && crystal_hz != 0) {
+            xhci_tsc_hz = ((uint64_t)crystal_hz * numerator) / denominator;
+        }
+    }
+    if (xhci_tsc_hz == 0 && max_leaf >= 0x16U) {
+        xhci_cpuid(0x16U, 0, &base_mhz, 0, 0, 0);
+        if (base_mhz != 0) {
+            xhci_tsc_hz = (uint64_t)base_mhz * 1000000ULL;
+        }
+    }
+
+    if (xhci_tsc_hz < 1000000000ULL || xhci_tsc_hz > 10000000000ULL) {
+        xhci_tsc_hz = 4000000000ULL;
+    }
+    return xhci_tsc_hz;
+}
+
+static uint64_t xhci_deadline_ms(uint64_t milliseconds) {
+    return xhci_read_tsc() + (xhci_get_tsc_hz() / 1000ULL) * milliseconds;
+}
+
+static int xhci_before_deadline(uint64_t deadline) {
+    uint64_t now = xhci_read_tsc();
+
+    if (xhci_probe_deadline != 0 &&
+        (int64_t)(xhci_probe_deadline - now) <= 0) {
+        xhci_probe_budget_expired = 1;
+        return 0;
+    }
+    if (xhci_storage_boot_deadline != 0 &&
+        (int64_t)(xhci_storage_boot_deadline - now) <= 0) {
+        xhci_storage_io_failed = 1;
+        return 0;
+    }
+    return (int64_t)(deadline - now) > 0;
+}
+
+static void xhci_delay_ms(uint64_t milliseconds) {
+    uint64_t deadline = xhci_deadline_ms(milliseconds);
+
+    while (xhci_before_deadline(deadline)) {
+        __asm__ volatile("pause");
+    }
+}
+
 static uint32_t mmio_read32(volatile uint8_t *base, uint64_t offset) {
     return *(volatile uint32_t *)(base + offset);
 }
@@ -216,28 +326,37 @@ static void mmio_write64(volatile uint8_t *base, uint64_t offset, uint64_t value
 }
 
 static int mmio_wait32_set(volatile uint8_t *base, uint64_t offset, uint32_t mask) {
-    for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
+    uint64_t deadline = xhci_deadline_ms(XHCI_REGISTER_TIMEOUT_MS);
+
+    while (xhci_before_deadline(deadline)) {
         if ((mmio_read32(base, offset) & mask) == mask) {
             return 0;
         }
+        __asm__ volatile("pause");
     }
     return -1;
 }
 
 static int mmio_wait32_clear(volatile uint8_t *base, uint64_t offset, uint32_t mask) {
-    for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
+    uint64_t deadline = xhci_deadline_ms(XHCI_REGISTER_TIMEOUT_MS);
+
+    while (xhci_before_deadline(deadline)) {
         if ((mmio_read32(base, offset) & mask) == 0) {
             return 0;
         }
+        __asm__ volatile("pause");
     }
     return -1;
 }
 
 static int mmio_wait32_field_clear(volatile uint8_t *base, uint64_t offset, uint32_t mask) {
-    for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
+    uint64_t deadline = xhci_deadline_ms(XHCI_REGISTER_TIMEOUT_MS);
+
+    while (xhci_before_deadline(deadline)) {
         if ((mmio_read32(base, offset) & mask) == 0) {
             return 0;
         }
+        __asm__ volatile("pause");
     }
     return -1;
 }
@@ -383,9 +502,7 @@ static int xhci_port_needs_warm_reset(uint32_t before, uint32_t after) {
 }
 
 static void xhci_port_delay(void) {
-    for (uint64_t spin = 0; spin < XHCI_PORT_CONNECT_RESCAN_DELAY; spin++) {
-        __asm__ volatile("pause");
-    }
+    xhci_delay_ms(XHCI_PORT_POLL_DELAY_MS);
 }
 
 static uint64_t xhci_dci_from_endpoint_address(uint64_t endpoint_address) {
@@ -439,13 +556,30 @@ static void write_be16(uint8_t *buffer, uint16_t value) {
     buffer[1] = (uint8_t)value;
 }
 
+static void xhci_advance_event_ring(volatile uint8_t *ir0) {
+    if (ir0 == 0 || xhci_info.event_ring_phys == 0) {
+        return;
+    }
+
+    xhci_event_ring_dequeue++;
+    if (xhci_event_ring_dequeue >= XHCI_EVENT_RING_SEGMENT_TRBS) {
+        xhci_event_ring_dequeue = 0;
+        xhci_event_ring_cycle ^= 1;
+    }
+
+    xhci_info.erdp_value = xhci_info.event_ring_phys +
+                           XHCI_TRB_SIZE * xhci_event_ring_dequeue;
+    mmio_write64(ir0, XHCI_IR_ERDP, xhci_info.erdp_value | XHCI_ERDP_EHB);
+    xhci_info.erdp_value = mmio_read64(ir0, XHCI_IR_ERDP);
+}
+
 static int xhci_wait_transfer_event_for_trbs(volatile uint8_t *regs,
                                             uint64_t first_event_index,
                                             uint64_t expected_slot_id,
                                             uint64_t expected_trb_phys,
                                             uint64_t alternate_trb_phys,
                                             int accept_short_packet,
-                                            uint64_t poll_limit,
+                                            uint64_t timeout_ms,
                                             uint64_t *completion_code,
                                             uint64_t *event_type_out,
                                             uint64_t *event_trb0,
@@ -455,80 +589,69 @@ static int xhci_wait_transfer_event_for_trbs(volatile uint8_t *regs,
     volatile uint8_t *rt;
     volatile uint8_t *ir0;
     volatile uint32_t *event_ring;
+    uint64_t deadline;
+
+    (void)first_event_index;
 
     if (regs == 0 || xhci_info.runtime_offset == 0 ||
-        xhci_info.event_ring_phys == 0 ||
-        first_event_index >= XHCI_EVENT_RING_SEGMENT_TRBS ||
-        expected_trb_phys == 0) {
+        xhci_info.event_ring_phys == 0 || expected_trb_phys == 0) {
         return -1;
     }
-    if (poll_limit == 0) {
-        poll_limit = XHCI_POLL_LIMIT;
+    if (timeout_ms == 0) {
+        timeout_ms = XHCI_CONTROL_TRANSFER_TIMEOUT_MS;
     }
 
     rt = regs + xhci_info.runtime_offset;
     ir0 = rt + XHCI_RUNTIME_IR0_OFFSET;
     event_ring = (volatile uint32_t *)phys_to_virt(xhci_info.event_ring_phys);
+    deadline = xhci_deadline_ms(timeout_ms);
 
-    for (uint64_t spin = 0; spin < poll_limit; spin++) {
-        for (uint64_t scanned = 0; scanned < XHCI_EVENT_RING_SEGMENT_TRBS; scanned++) {
-            uint64_t event_index = first_event_index + scanned;
-            if (event_index >= XHCI_EVENT_RING_SEGMENT_TRBS) {
-                event_index -= XHCI_EVENT_RING_SEGMENT_TRBS;
-            }
-
-            uint64_t trb_index = event_index * 4;
-            uint32_t control = event_ring[trb_index + 3];
-            if ((control & XHCI_TRB_CYCLE) == 0) {
-                continue;
-            }
-
-            uint64_t event_type = (control >> XHCI_TRB_TYPE_SHIFT) & 0x3fU;
-            uint64_t event_slot_id = control >> 24;
-            uint64_t event_trb_phys = (uint64_t)event_ring[trb_index + 0] |
-                                      ((uint64_t)event_ring[trb_index + 1] << 32);
-            if (event_type != XHCI_TRANSFER_EVENT_TYPE ||
-                event_slot_id != expected_slot_id ||
-                (event_trb_phys != expected_trb_phys &&
-                 event_trb_phys != alternate_trb_phys)) {
-                continue;
-            }
-
-            if (event_trb0 != 0) {
-                *event_trb0 = event_ring[trb_index + 0];
-            }
-            if (event_trb1 != 0) {
-                *event_trb1 = event_ring[trb_index + 1];
-            }
-            if (event_trb2 != 0) {
-                *event_trb2 = event_ring[trb_index + 2];
-            }
-            if (event_trb3 != 0) {
-                *event_trb3 = event_ring[trb_index + 3];
-            }
-            if (event_type_out != 0) {
-                *event_type_out = event_type;
-            }
-            if (completion_code != 0) {
-                *completion_code = event_ring[trb_index + 2] >> 24;
-            }
-
-            uint64_t next_event = event_index + 1;
-            if (next_event >= XHCI_EVENT_RING_SEGMENT_TRBS) {
-                next_event = 0;
-            }
-            xhci_info.erdp_value = xhci_info.event_ring_phys + XHCI_TRB_SIZE * next_event;
-            mmio_write64(ir0, XHCI_IR_ERDP, xhci_info.erdp_value | XHCI_ERDP_EHB);
-            xhci_info.erdp_value = mmio_read64(ir0, XHCI_IR_ERDP);
-            uint64_t code = event_ring[trb_index + 2] >> 24;
-            if (code == XHCI_COMPLETION_SUCCESS ||
-                (accept_short_packet &&
-                 event_trb_phys == alternate_trb_phys &&
-                 code == XHCI_COMPLETION_SHORT_PACKET)) {
-                return 0;
-            }
-            return -1;
+    while (xhci_before_deadline(deadline)) {
+        uint64_t trb_index = xhci_event_ring_dequeue * 4;
+        uint32_t control = event_ring[trb_index + 3];
+        if ((control & XHCI_TRB_CYCLE) != xhci_event_ring_cycle) {
+            __asm__ volatile("pause");
+            continue;
         }
+
+        uint64_t event_type = (control >> XHCI_TRB_TYPE_SHIFT) & 0x3fU;
+        uint64_t event_slot_id = control >> 24;
+        uint64_t event_trb_phys = (uint64_t)event_ring[trb_index + 0] |
+                                  ((uint64_t)event_ring[trb_index + 1] << 32);
+        if (event_type != XHCI_TRANSFER_EVENT_TYPE ||
+            event_slot_id != expected_slot_id ||
+            (event_trb_phys != expected_trb_phys &&
+             event_trb_phys != alternate_trb_phys)) {
+            xhci_advance_event_ring(ir0);
+            continue;
+        }
+
+        if (event_trb0 != 0) {
+            *event_trb0 = event_ring[trb_index + 0];
+        }
+        if (event_trb1 != 0) {
+            *event_trb1 = event_ring[trb_index + 1];
+        }
+        if (event_trb2 != 0) {
+            *event_trb2 = event_ring[trb_index + 2];
+        }
+        if (event_trb3 != 0) {
+            *event_trb3 = event_ring[trb_index + 3];
+        }
+        if (event_type_out != 0) {
+            *event_type_out = event_type;
+        }
+        if (completion_code != 0) {
+            *completion_code = event_ring[trb_index + 2] >> 24;
+        }
+
+        uint64_t code = event_ring[trb_index + 2] >> 24;
+        xhci_advance_event_ring(ir0);
+        if (code == XHCI_COMPLETION_SUCCESS ||
+            (accept_short_packet && code == XHCI_COMPLETION_SHORT_PACKET)) {
+            return 0;
+        }
+        return -1;
     }
 
     return -1;
@@ -608,6 +731,7 @@ static int xhci_wait_command_completion(volatile uint8_t *regs,
     volatile uint8_t *rt;
     volatile uint8_t *ir0;
     volatile uint32_t *event_ring;
+    uint64_t deadline;
 
     if (regs == 0 || xhci_info.runtime_offset == 0 ||
         xhci_info.event_ring_phys == 0 || command_trb_phys == 0) {
@@ -617,31 +741,30 @@ static int xhci_wait_command_completion(volatile uint8_t *regs,
     rt = regs + xhci_info.runtime_offset;
     ir0 = rt + XHCI_RUNTIME_IR0_OFFSET;
     event_ring = (volatile uint32_t *)phys_to_virt(xhci_info.event_ring_phys);
+    deadline = xhci_deadline_ms(XHCI_COMMAND_TIMEOUT_MS);
 
-    for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
-        for (uint64_t event_index = 0;
-             event_index < XHCI_EVENT_RING_SEGMENT_TRBS;
-             event_index++) {
-            uint64_t trb_index = event_index * 4;
+    while (xhci_before_deadline(deadline)) {
+            uint64_t trb_index = xhci_event_ring_dequeue * 4;
             uint32_t control = event_ring[trb_index + 3];
             uint64_t event_type;
             uint64_t event_slot_id;
             uint64_t event_command_phys;
             uint64_t code;
-            uint64_t next_event;
-
-            if ((control & XHCI_TRB_CYCLE) == 0) {
+            if ((control & XHCI_TRB_CYCLE) != xhci_event_ring_cycle) {
+                __asm__ volatile("pause");
                 continue;
             }
 
             event_type = (control >> XHCI_TRB_TYPE_SHIFT) & 0x3fU;
             if (event_type != XHCI_COMMAND_COMPLETION_EVENT_TYPE) {
+                xhci_advance_event_ring(ir0);
                 continue;
             }
 
             event_command_phys = (uint64_t)event_ring[trb_index + 0] |
                                  ((uint64_t)event_ring[trb_index + 1] << 32);
             if (event_command_phys != command_trb_phys) {
+                xhci_advance_event_ring(ir0);
                 continue;
             }
 
@@ -670,13 +793,7 @@ static int xhci_wait_command_completion(volatile uint8_t *regs,
                 *slot_id_out = event_slot_id;
             }
 
-            next_event = event_index + 1;
-            if (next_event >= XHCI_EVENT_RING_SEGMENT_TRBS) {
-                next_event = 0;
-            }
-            xhci_info.erdp_value = xhci_info.event_ring_phys + XHCI_TRB_SIZE * next_event;
-            mmio_write64(ir0, XHCI_IR_ERDP, xhci_info.erdp_value | XHCI_ERDP_EHB);
-            xhci_info.erdp_value = mmio_read64(ir0, XHCI_IR_ERDP);
+            xhci_advance_event_ring(ir0);
 
             if (code != XHCI_COMPLETION_SUCCESS) {
                 return -1;
@@ -685,7 +802,6 @@ static int xhci_wait_command_completion(volatile uint8_t *regs,
                 return -1;
             }
             return 0;
-        }
     }
 
     return -1;
@@ -1005,7 +1121,7 @@ static int xhci_ep0_control_transfer(volatile uint8_t *regs,
                                                      XHCI_TRB_SIZE * (start_trb + 1) :
                                                  0,
                                              length != 0,
-                                             XHCI_POLL_LIMIT,
+                                             XHCI_CONTROL_TRANSFER_TIMEOUT_MS,
                                              completion_code,
                                              0,
                                              0,
@@ -1297,6 +1413,8 @@ static void xhci_configure_rings(volatile uint8_t *regs) {
         (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) | XHCI_LINK_TRB_TOGGLE_CYCLE | 1ULL;
     xhci_command_ring_next_trb = 0;
     xhci_command_ring_cycle = 1;
+    xhci_event_ring_dequeue = 0;
+    xhci_event_ring_cycle = 1;
 
     scratchpad_count = xhci_info.scratchpad_count;
     if (scratchpad_count > (PAGE_SIZE / sizeof(uint64_t))) {
@@ -1597,6 +1715,7 @@ static void xhci_reset_root_port(volatile uint8_t *regs, uint64_t port) {
     uint32_t before;
     uint32_t after = 0;
     uint32_t warm_after = 0;
+    uint64_t deadline;
 
     if (regs == 0 || !xhci_info.reset_allowed || !xhci_info.controller_started) {
         return;
@@ -1629,11 +1748,13 @@ static void xhci_reset_root_port(volatile uint8_t *regs, uint64_t port) {
     xhci_info.port_reset_portsc_before = before;
     mmio_write32(op, offset, xhci_portsc_neutral_write_value(before) | XHCI_PORTSC_PR);
 
-    for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
+    deadline = xhci_deadline_ms(XHCI_ROOT_PORT_RESET_TIMEOUT_MS);
+    while (xhci_before_deadline(deadline)) {
         after = mmio_read32(op, offset);
         if ((after & XHCI_PORTSC_PR) == 0) {
             break;
         }
+        __asm__ volatile("pause");
     }
 
     if (!xhci_port_reset_succeeded(after) &&
@@ -1643,12 +1764,14 @@ static void xhci_reset_root_port(volatile uint8_t *regs, uint64_t port) {
         mmio_write32(op, offset,
                      xhci_portsc_neutral_write_value(mmio_read32(op, offset)) |
                          XHCI_PORTSC_WPR);
-        for (uint64_t spin = 0; spin < XHCI_POLL_LIMIT; spin++) {
+        deadline = xhci_deadline_ms(XHCI_ROOT_PORT_RESET_TIMEOUT_MS);
+        while (xhci_before_deadline(deadline)) {
             warm_after = mmio_read32(op, offset);
             if ((warm_after & XHCI_PORTSC_WPR) == 0 &&
                 (warm_after & XHCI_PORTSC_PR) == 0) {
                 break;
             }
+            __asm__ volatile("pause");
         }
         xhci_port_delay();
         warm_after = mmio_read32(op, offset);
@@ -2075,25 +2198,27 @@ static int xhci_hub_get_port_status(volatile uint8_t *regs,
     if (buffer_phys == 0 || status == 0 || change == 0) {
         return -1;
     }
-    zero_page_phys(buffer_phys);
-    if (xhci_ep0_control_transfer(regs,
-                                  ring_trb_index,
-                                  first_event_index,
-                                  0xa3,
-                                  USB_REQUEST_GET_STATUS,
-                                  0,
-                                  (uint16_t)port,
-                                  4,
-                                  buffer_phys,
-                                  1,
-                                  &completion_code) != 0) {
-        return -1;
+    for (uint64_t attempt = 0; attempt < USB_HUB_STATUS_RETRIES; attempt++) {
+        zero_page_phys(buffer_phys);
+        if (xhci_ep0_control_transfer(regs,
+                                      ring_trb_index,
+                                      first_event_index,
+                                      0xa3,
+                                      USB_REQUEST_GET_STATUS,
+                                      0,
+                                      (uint16_t)port,
+                                      4,
+                                      buffer_phys,
+                                      1,
+                                      &completion_code) == 0) {
+            buffer = (uint8_t *)phys_to_virt(buffer_phys);
+            *status = (uint64_t)buffer[0] | ((uint64_t)buffer[1] << 8);
+            *change = (uint64_t)buffer[2] | ((uint64_t)buffer[3] << 8);
+            return 0;
+        }
+        xhci_port_delay();
     }
-
-    buffer = (uint8_t *)phys_to_virt(buffer_phys);
-    *status = (uint64_t)buffer[0] | ((uint64_t)buffer[1] << 8);
-    *change = (uint64_t)buffer[2] | ((uint64_t)buffer[3] << 8);
-    return 0;
+    return -1;
 }
 
 static int xhci_hub_clear_port_feature(volatile uint8_t *regs,
@@ -2251,6 +2376,87 @@ static void xhci_configure_first_hub_endpoint(volatile uint8_t *regs) {
     xhci_info.configure_endpoint_slot_id = event_slot_id;
 }
 
+static void xhci_update_current_hub_slot_context(volatile uint8_t *regs) {
+    uint32_t *input_context;
+    uint32_t *slot_context;
+    uint32_t *output_slot_context;
+    uint64_t context_size;
+    uint64_t slot_id;
+    uint64_t command_trb_phys = 0;
+    uint64_t event_slot_id = 0;
+
+    if (regs == 0 || !xhci_info.hub_descriptor_ok ||
+        xhci_info.hub_port_count == 0 ||
+        xhci_info.address_device_slot_id == 0 ||
+        xhci_info.output_context_phys == 0) {
+        return;
+    }
+    if (xhci_info.doorbell_offset == 0 || xhci_info.runtime_offset == 0 ||
+        xhci_info.command_ring_phys == 0 || xhci_info.event_ring_phys == 0) {
+        return;
+    }
+
+    slot_id = xhci_info.address_device_slot_id;
+    context_size = xhci_info.context_size;
+    if (context_size == 0) {
+        context_size = 32;
+    }
+
+    xhci_info.hub_slot_update_input_context_phys = pmm_alloc_page();
+    if (xhci_info.hub_slot_update_input_context_phys == 0) {
+        return;
+    }
+    zero_page_phys(xhci_info.hub_slot_update_input_context_phys);
+
+    input_context = (uint32_t *)phys_to_virt(xhci_info.hub_slot_update_input_context_phys);
+    slot_context = (uint32_t *)((uint8_t *)input_context + context_size);
+    output_slot_context = (uint32_t *)phys_to_virt(xhci_info.output_context_phys);
+
+    input_context[1] = 1U;
+    copy_bytes(slot_context, output_slot_context, context_size);
+    slot_context[0] |= XHCI_SLOT_CONTEXT_HUB;
+    if (xhci_info.device_protocol == 2 || xhci_info.first_interface_protocol == 2) {
+        slot_context[0] |= XHCI_SLOT_CONTEXT_MTT;
+    }
+    slot_context[1] = (slot_context[1] & ~XHCI_SLOT_CONTEXT_MAX_PORTS_MASK) |
+                      (uint32_t)((xhci_info.hub_port_count & 0xffULL) <<
+                                 XHCI_SLOT_CONTEXT_MAX_PORTS_SHIFT);
+    slot_context[2] = (slot_context[2] & ~XHCI_SLOT_CONTEXT_TT_THINK_TIME_MASK) |
+                      (uint32_t)(((xhci_info.hub_characteristics >> 5) & 0x3ULL) <<
+                                 XHCI_SLOT_CONTEXT_TT_THINK_TIME_SHIFT);
+    xhci_info.hub_slot_update_context0 = slot_context[0];
+    xhci_info.hub_slot_update_context1 = slot_context[1];
+    xhci_info.hub_slot_update_context2 = slot_context[2];
+
+    xhci_info.hub_slot_update_attempted = 1;
+    if (xhci_submit_command(regs,
+                            xhci_info.hub_slot_update_input_context_phys,
+                            xhci_info.hub_slot_update_input_context_phys >> 32,
+                            0,
+                            (slot_id << 24) |
+                                (XHCI_CONFIGURE_ENDPOINT_TRB_TYPE << XHCI_TRB_TYPE_SHIFT),
+                            &command_trb_phys) != 0) {
+        return;
+    }
+    if (xhci_wait_command_completion(regs,
+                                     command_trb_phys,
+                                     slot_id,
+                                     &xhci_info.hub_slot_update_completion_code,
+                                     &event_slot_id,
+                                     &xhci_info.hub_slot_update_event_type,
+                                     &xhci_info.hub_slot_update_event_trb0,
+                                     &xhci_info.hub_slot_update_event_trb1,
+                                     &xhci_info.hub_slot_update_event_trb2,
+                                     &xhci_info.hub_slot_update_event_trb3) == 0) {
+        output_slot_context = (uint32_t *)phys_to_virt(xhci_info.output_context_phys);
+        xhci_info.hub_slot_update_ok = 1;
+        xhci_info.hub_slot_update_context0 = output_slot_context[0];
+        xhci_info.hub_slot_update_context1 = output_slot_context[1];
+        xhci_info.hub_slot_update_context2 = output_slot_context[2];
+    }
+    xhci_info.hub_slot_update_slot_id = event_slot_id;
+}
+
 static void xhci_probe_hub_downstream_ports(volatile uint8_t *regs) {
     uint8_t *descriptor;
     uint64_t status_buffer_phys;
@@ -2258,6 +2464,7 @@ static void xhci_probe_hub_downstream_ports(volatile uint8_t *regs) {
     uint64_t change = 0;
     uint64_t ring_index = 11;
     uint64_t event_index = 8;
+    uint64_t power_good_ms;
 
     if (regs == 0 || !xhci_info.configuration_descriptor_ok ||
         !(xhci_info.device_class == USB_CLASS_HUB ||
@@ -2347,6 +2554,11 @@ static void xhci_probe_hub_downstream_ports(volatile uint8_t *regs) {
         return;
     }
 
+    xhci_update_current_hub_slot_context(regs);
+    if (!xhci_info.hub_slot_update_ok) {
+        return;
+    }
+
     status_buffer_phys = pmm_alloc_page();
     if (status_buffer_phys == 0) {
         return;
@@ -2376,7 +2588,11 @@ static void xhci_probe_hub_downstream_ports(volatile uint8_t *regs) {
         }
     }
 
-    xhci_port_delay();
+    power_good_ms = xhci_info.hub_power_on_to_power_good * 2ULL;
+    if (power_good_ms < 100ULL) {
+        power_good_ms = 100ULL;
+    }
+    xhci_delay_ms(power_good_ms);
 
     for (uint64_t port = 1; port <= xhci_info.hub_port_count; port++) {
         xhci_info.hub_port_status_attempted++;
@@ -2442,7 +2658,7 @@ static void xhci_probe_hub_downstream_ports(volatile uint8_t *regs) {
         event_index >= XHCI_EVENT_RING_SEGMENT_TRBS - 1) {
         return;
     }
-    xhci_port_delay();
+    xhci_delay_ms(USB_HUB_DEBOUNCE_STABLE_MS);
     if (xhci_hub_get_port_status(regs,
                                  xhci_info.hub_first_connected_port,
                                  ring_index,
@@ -2672,6 +2888,7 @@ static int xhci_bulk_transfer_dynamic(volatile uint8_t *regs,
                                       uint64_t endpoint_dci,
                                       uint64_t buffer_phys,
                                       uint64_t length,
+                                      int accept_short_packet,
                                       uint64_t *completion_code,
                                       uint64_t *event_type_out,
                                       uint64_t *event_trb0,
@@ -2717,6 +2934,7 @@ static int xhci_bulk_transfer_dynamic(volatile uint8_t *regs,
     ring[base + 2] = (uint32_t)length;
     ring[base + 3] = (uint32_t)((XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
                                 XHCI_TRB_IOC |
+                                (accept_short_packet ? XHCI_TRB_ISP : 0) |
                                 (*producer_cycle ? XHCI_TRB_CYCLE : 0));
     __sync_synchronize();
 
@@ -2726,8 +2944,8 @@ static int xhci_bulk_transfer_dynamic(volatile uint8_t *regs,
                                           slot_id,
                                           trb_phys,
                                           0,
-                                          0,
-                                          XHCI_BULK_EVENT_POLL_LIMIT,
+                                          accept_short_packet,
+                                          XHCI_BULK_TRANSFER_TIMEOUT_MS,
                                           completion_code,
                                           event_type_out,
                                           event_trb0,
@@ -2819,12 +3037,13 @@ static int xhci_bot_scsi_command_dynamic(volatile uint8_t *regs,
                                    xhci_info.first_bulk_out_dci,
                                    xhci_info.bot_cbw_phys,
                                    USB_BOT_CBW_LENGTH,
+                                   0,
                                    &result->cbw_completion_code,
                                    &result->cbw_event_type,
-                                   0,
-                                   0,
-                                   0,
-                                   0) != 0) {
+                                   &xhci_info.bot_cbw_event_trb0,
+                                   &xhci_info.bot_cbw_event_trb1,
+                                   &xhci_info.bot_cbw_event_trb2,
+                                   &xhci_info.bot_cbw_event_trb3) != 0) {
         xhci_info.bot_last_error_stage = USB_BOT_STAGE_CBW;
         return -1;
     }
@@ -2838,12 +3057,13 @@ static int xhci_bot_scsi_command_dynamic(volatile uint8_t *regs,
                                    data_in ? xhci_info.first_bulk_in_dci : xhci_info.first_bulk_out_dci,
                                    data_phys,
                                    data_length,
+                                   data_in ? 1 : 0,
                                    &result->data_completion_code,
                                    &result->data_event_type,
-                                   0,
-                                   0,
-                                   0,
-                                   0) != 0) {
+                                   &xhci_info.bot_data_event_trb0,
+                                   &xhci_info.bot_data_event_trb1,
+                                   &xhci_info.bot_data_event_trb2,
+                                   &xhci_info.bot_data_event_trb3) != 0) {
         xhci_info.bot_last_error_stage = USB_BOT_STAGE_DATA;
         return -1;
     }
@@ -2857,14 +3077,40 @@ static int xhci_bot_scsi_command_dynamic(volatile uint8_t *regs,
                                    xhci_info.first_bulk_in_dci,
                                    xhci_info.bot_csw_phys,
                                    USB_BOT_CSW_LENGTH,
+                                   1,
                                    &result->csw_completion_code,
                                    &result->csw_event_type,
-                                   0,
-                                   0,
-                                   0,
-                                   0) != 0) {
+                                   &xhci_info.bot_csw_event_trb0,
+                                   &xhci_info.bot_csw_event_trb1,
+                                   &xhci_info.bot_csw_event_trb2,
+                                   &xhci_info.bot_csw_event_trb3) != 0) {
         xhci_info.bot_last_error_stage = USB_BOT_STAGE_CSW;
         return -1;
+    }
+
+    if (result->csw_completion_code == XHCI_COMPLETION_SHORT_PACKET &&
+        (xhci_info.bot_csw_event_trb2 & XHCI_TRANSFER_EVENT_RESIDUAL_MASK) ==
+            USB_BOT_CSW_LENGTH) {
+        zero_page_phys(xhci_info.bot_csw_phys);
+        if (xhci_bulk_transfer_dynamic(regs,
+                                       xhci_info.bulk_in_ring_phys,
+                                       &xhci_bulk_in_next_trb,
+                                       &xhci_bulk_in_cycle,
+                                       &xhci_bulk_in_wraps,
+                                       "bulk-in",
+                                       xhci_info.first_bulk_in_dci,
+                                       xhci_info.bot_csw_phys,
+                                       USB_BOT_CSW_LENGTH,
+                                       1,
+                                       &result->csw_completion_code,
+                                       &result->csw_event_type,
+                                       &xhci_info.bot_csw_event_trb0,
+                                       &xhci_info.bot_csw_event_trb1,
+                                       &xhci_info.bot_csw_event_trb2,
+                                       &xhci_info.bot_csw_event_trb3) != 0) {
+            xhci_info.bot_last_error_stage = USB_BOT_STAGE_CSW;
+            return -1;
+        }
     }
 
     csw = (uint8_t *)phys_to_virt(xhci_info.bot_csw_phys);
@@ -2972,6 +3218,41 @@ static int xhci_probe_has_meaningful_device_state(void) {
     return 0;
 }
 
+static uint64_t xhci_probe_state_score(void) {
+    if (xhci_info.bot_capacity_ok && xhci_info.bot_read10_ok) {
+        return 100;
+    }
+    if (xhci_info.bot_inquiry_attempted ||
+        xhci_info.bot_capacity_attempted ||
+        xhci_info.bot_read10_attempted) {
+        return 80;
+    }
+    if (xhci_info.first_interface_class == 8 &&
+        xhci_info.first_interface_subclass == 6 &&
+        xhci_info.first_interface_protocol == 80) {
+        return 70;
+    }
+    if (xhci_info.hub_port_reset_ok) {
+        return 60;
+    }
+    if (xhci_info.hub_slot_update_attempted) {
+        return 55;
+    }
+    if (xhci_info.hub_detected && xhci_info.hub_first_connected_port != 0) {
+        return 50;
+    }
+    if (xhci_info.hub_detected) {
+        return 40;
+    }
+    if (xhci_info.address_device_ok) {
+        return 30;
+    }
+    if (xhci_info.port_reset_attempted) {
+        return 20;
+    }
+    return 0;
+}
+
 static int xhci_try_connected_root_port(volatile uint8_t *regs,
                                         volatile uint8_t *op,
                                         uint64_t port,
@@ -2997,7 +3278,7 @@ static int xhci_try_connected_root_port(volatile uint8_t *regs,
         return 1;
     }
     *use_existing_slot = 0;
-    return xhci_probe_has_meaningful_device_state();
+    return 0;
 }
 
 static void xhci_probe_connected_root_ports(volatile uint8_t *regs) {
@@ -3005,6 +3286,9 @@ static void xhci_probe_connected_root_ports(volatile uint8_t *regs) {
     uint64_t limit;
     int use_existing_slot = 1;
     uint64_t selected_port;
+    uint64_t best_score = 0;
+    struct pci_xhci_info best_info;
+    int best_info_valid = 0;
 
     if (regs == 0 || !xhci_info.op_regs_ready || xhci_info.cap_length == 0 ||
         !xhci_info.rings_ready || !xhci_info.controller_started) {
@@ -3022,6 +3306,11 @@ static void xhci_probe_connected_root_ports(volatile uint8_t *regs) {
         xhci_try_connected_root_port(regs, op, selected_port, &use_existing_slot)) {
         return;
     }
+    if (xhci_probe_has_meaningful_device_state()) {
+        best_score = xhci_probe_state_score();
+        copy_bytes(&best_info, &xhci_info, sizeof(best_info));
+        best_info_valid = 1;
+    }
 
     for (uint64_t port = 1; port <= limit; port++) {
         if (port == selected_port) {
@@ -3030,6 +3319,18 @@ static void xhci_probe_connected_root_ports(volatile uint8_t *regs) {
         if (xhci_try_connected_root_port(regs, op, port, &use_existing_slot)) {
             return;
         }
+        if (xhci_probe_has_meaningful_device_state()) {
+            uint64_t score = xhci_probe_state_score();
+            if (!best_info_valid || score > best_score) {
+                best_score = score;
+                copy_bytes(&best_info, &xhci_info, sizeof(best_info));
+                best_info_valid = 1;
+            }
+        }
+    }
+
+    if (best_info_valid) {
+        copy_bytes(&xhci_info, &best_info, sizeof(xhci_info));
     }
 }
 
@@ -3288,7 +3589,8 @@ static int xhci_usb_storage_read_sector(uint64_t lba, void *buffer) {
     uint64_t tag;
     uint8_t *data;
 
-    if (xhci_regs == 0 || buffer == 0 || !xhci_info.bot_capacity_ok ||
+    if (xhci_storage_io_failed || xhci_regs == 0 || buffer == 0 ||
+        !xhci_info.bot_capacity_ok ||
         xhci_info.bot_capacity_block_size != 512 ||
         xhci_info.bot_read10_data_phys == 0 ||
         !xhci_bot_ring_ready || xhci_bot_next_tag == 0) {
@@ -3325,6 +3627,7 @@ static int xhci_usb_storage_read_sector(uint64_t lba, void *buffer) {
         xhci_info.bot_read10_csw_residue = result.csw_residue;
         xhci_info.bot_read10_csw_status = result.csw_status;
         xhci_info.bot_read10_ok = 0;
+        xhci_storage_io_failed = 1;
         return -1;
     }
 
@@ -3349,7 +3652,8 @@ static int xhci_usb_storage_write_sector(uint64_t lba, const void *buffer) {
     uint64_t tag;
     uint8_t *data;
 
-    if (xhci_regs == 0 || buffer == 0 || !xhci_info.bot_capacity_ok ||
+    if (xhci_storage_io_failed || xhci_regs == 0 || buffer == 0 ||
+        !xhci_info.bot_capacity_ok ||
         xhci_info.bot_capacity_block_size != 512 ||
         xhci_info.bot_read10_data_phys == 0 ||
         !xhci_bot_ring_ready || xhci_bot_next_tag == 0) {
@@ -3390,6 +3694,7 @@ static int xhci_usb_storage_write_sector(uint64_t lba, const void *buffer) {
         xhci_info.bot_write10_first8 = read_le64(&data[0]);
         xhci_info.bot_write10_second8 = read_le64(&data[8]);
         xhci_info.bot_write10_ok = 0;
+        xhci_storage_io_failed = 1;
         return -1;
     }
 
@@ -3481,12 +3786,17 @@ int pci_register_usb_storage_block_device(void) {
     if (xhci_usb_storage_registered) {
         return 0;
     }
-    if (!xhci_info.bot_capacity_ok || !xhci_info.bot_read10_ok ||
+    if (xhci_probe_budget_expired || !xhci_info.bot_capacity_ok ||
+        !xhci_info.bot_read10_ok ||
         xhci_info.bot_capacity_block_size != 512 ||
         xhci_info.bot_capacity_block_count == 0 ||
         xhci_regs == 0) {
         return -1;
     }
+
+    xhci_storage_io_failed = 0;
+    xhci_storage_boot_deadline =
+        xhci_deadline_ms(XHCI_STORAGE_BOOT_TIMEOUT_MS);
 
     xhci_info.usb_storage_readonly_policy = USB_STORAGE_POLICY_UNKNOWN;
     if (qemu_controller) {
@@ -3531,9 +3841,17 @@ int pci_register_usb_storage_block_device(void) {
     return 0;
 }
 
+void pci_finish_usb_storage_boot_io(void) {
+    xhci_storage_boot_deadline = 0;
+}
+
 static void pci_scan_xhci(void) {
     struct pci_device device;
 
+    xhci_probe_deadline = 0;
+    xhci_storage_boot_deadline = 0;
+    xhci_probe_budget_expired = 0;
+    xhci_storage_io_failed = 0;
     zero_bytes(&xhci_info, sizeof(xhci_info));
     xhci_regs = 0;
     xhci_bulk_out_next_trb = 0;
@@ -3592,6 +3910,8 @@ static void pci_scan_xhci(void) {
                         if (regs != 0) {
                             uint32_t capreg;
                             uint32_t hcsparams1;
+                            xhci_probe_deadline =
+                                xhci_deadline_ms(XHCI_PROBE_TOTAL_TIMEOUT_MS);
                             xhci_regs = regs;
                             xhci_info.mmio_mapped = 1;
                             capreg = *(volatile uint32_t *)(regs + 0x00);
@@ -3857,6 +4177,7 @@ static void pci_scan_xhci(void) {
                                      xhci_info.bot_write10_first8,
                                      xhci_info.bot_write10_second8);
                         }
+                        goto scan_done;
                     }
                 }
                 if (function == 0 && (pci_read_config8((uint8_t)bus, slot, function, 0x0e) & 0x80) == 0) {
@@ -3865,6 +4186,8 @@ static void pci_scan_xhci(void) {
             }
         }
     }
+scan_done:
+    xhci_probe_deadline = 0;
     if (!xhci_info.found) {
         log_info("xHCI controller not found\n");
     }

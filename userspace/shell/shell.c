@@ -1875,12 +1875,40 @@ static void cmd_usbdiag(void) {
     write_u64_hex(info.xhci_hub_port_reset_change ?
                   info.xhci_hub_port_reset_change :
                   info.xhci_hub_first_port_change);
+    write_cstr("\nhub slot update attempted/ok/cc: ");
+    write_u64_decimal(info.xhci_hub_slot_update_attempted);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_slot_update_ok);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_hub_slot_update_completion_code);
+    write_cstr("\nhub slot id/ctx0/ctx1: ");
+    write_u64_decimal(info.xhci_hub_slot_update_slot_id);
+    write_cstr("/");
+    write_u64_hex(info.xhci_hub_slot_update_context0);
+    write_cstr("/");
+    write_u64_hex(info.xhci_hub_slot_update_context1);
     write_cstr("\nbot_inquiry/read_capacity/read10: ");
     write_u64_decimal(info.xhci_bot_inquiry_ok);
     write_cstr("/");
     write_u64_decimal(info.xhci_bot_capacity_ok);
     write_cstr("/");
     write_u64_decimal(info.xhci_bot_read10_ok);
+    write_cstr("\nbot cc cbw/data/csw/stage: ");
+    write_u64_decimal(info.xhci_bot_cbw_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_data_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_csw_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_last_error_stage);
+    write_cstr("\nbot csw event trb: ");
+    write_u64_hex(info.xhci_bot_csw_event_trb0);
+    write_cstr(" ");
+    write_u64_hex(info.xhci_bot_csw_event_trb1);
+    write_cstr(" ");
+    write_u64_hex(info.xhci_bot_csw_event_trb2);
+    write_cstr(" ");
+    write_u64_hex(info.xhci_bot_csw_event_trb3);
     write_cstr("\nusb0_present: ");
     write_u64_decimal(usb0_present);
     write_cstr("\nreason: ");
@@ -1912,6 +1940,14 @@ static void cmd_usbdiag(void) {
     } else if (info.xhci_hub_detected &&
                !info.xhci_hub_port_reset_ok) {
         write_cstr("usb_hub_downstream_reset_failed");
+    } else if (info.xhci_hub_detected &&
+               info.xhci_hub_descriptor_ok &&
+               !info.xhci_hub_slot_update_attempted) {
+        write_cstr("usb_hub_slot_context_update_not_attempted");
+    } else if (info.xhci_hub_detected &&
+               info.xhci_hub_slot_update_attempted &&
+               !info.xhci_hub_slot_update_ok) {
+        write_cstr("usb_hub_slot_context_update_failed");
     } else if (!info.xhci_address_device_attempted) {
         write_cstr(info.xhci_hub_detected ?
                    "usb_hub_second_slot_not_attempted" :
@@ -1942,7 +1978,10 @@ static void cmd_usbdiag(void) {
     write_cstr("\nhint: ");
     if (info.xhci_hub_detected ||
         info.xhci_device_class == 9 || info.xhci_first_interface_class == 9) {
-        if (info.xhci_hub_port_reset_ok) {
+        if (info.xhci_hub_slot_update_attempted &&
+            !info.xhci_hub_slot_update_ok) {
+            write_cstr("Hub slot context update failed; capture hub slot fields.");
+        } else if (info.xhci_hub_port_reset_ok) {
             write_cstr("Hub downstream reset works; inspect second-slot address/config/BOT fields.");
         } else {
             write_cstr("Hub support is partial; capture these hub fields for the next driver step.");
@@ -4073,6 +4112,41 @@ static void run_exfat_vfs_write_self_test(char *buffer, uint64_t buffer_len) {
 }
 #endif
 
+static __attribute__((unused)) void run_development_startup_self_tests(
+    char *heap, uint64_t heap_len) {
+    static const char shell_prefix[] = "shell.elf: startup commands\n";
+
+    run_startup_self_test(heap);
+    write_literal(shell_prefix, sizeof(shell_prefix) - 1);
+    cmd_ls("/");
+    cmd_ls("/dev");
+    cmd_cat("/hello.txt", heap, 256);
+    run_ramfs_self_test(heap, 256);
+    run_lseek_self_test(heap, 256);
+    run_unlink_self_test();
+    run_shell_script_self_test(heap, 256);
+    run_block_self_test(heap, 512);
+    run_virtio_block_self_test(heap, 512);
+    run_mount_info_self_test();
+    run_block_mount_self_test(heap, heap_len);
+    run_fat32_mount_self_test(heap, heap_len);
+    run_usb_mount_self_test(heap, heap_len);
+    run_writeaudit_self_test(heap, heap_len);
+    run_writeunlock_reject_self_test();
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    run_writeunlock_success_self_test(heap, heap_len);
+#endif
+    run_usb_fat32_mount_self_test(heap, heap_len);
+    run_usb_block_write_self_test(heap, heap_len);
+#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
+    run_usb_exfat_user_write_self_test(heap, heap_len);
+    run_exfat_vfs_write_self_test(heap, heap_len);
+#endif
+    cmd_ls("/");
+    cmd_cat("/ram-note.txt", heap, 256);
+    run_dup2_stdin_self_test(heap, 256);
+}
+
 __attribute__((noreturn))
 static void run_interactive_shell(uint64_t input_fd, char *buffer, uint64_t buffer_len) {
     static const char ready[] =
@@ -4102,7 +4176,6 @@ void _start(void) {
     static const char pid_prefix[] = "shell.elf: pid=";
     static const char brk_prefix[] = "shell.elf: brk=";
     static const char heap_fail[] = "shell.elf: sbrk failed\n";
-    static const char shell_prefix[] = "shell.elf: startup commands\n";
     static const char tty_ok[] = "shell.elf: /dev/tty open\n";
     static const char tty_write_ok[] = "shell.elf: write(/dev/tty) ok\n";
     static const char bad_fd_write_rejected[] = "shell.elf: bad write fd rejected\n";
@@ -4125,35 +4198,9 @@ void _start(void) {
         sys_exit(8);
     }
 
-    run_startup_self_test(heap);
-    write_literal(shell_prefix, sizeof(shell_prefix) - 1);
-    cmd_ls("/");
-    cmd_ls("/dev");
-    cmd_cat("/hello.txt", heap, 256);
-    run_ramfs_self_test(heap, 256);
-    run_lseek_self_test(heap, 256);
-    run_unlink_self_test();
-    run_shell_script_self_test(heap, 256);
-    run_block_self_test(heap, 512);
-    run_virtio_block_self_test(heap, 512);
-    run_mount_info_self_test();
-    run_block_mount_self_test(heap, 12288);
-    run_fat32_mount_self_test(heap, 12288);
-    run_usb_mount_self_test(heap, 12288);
-    run_writeaudit_self_test(heap, 12288);
-    run_writeunlock_reject_self_test();
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
-    run_writeunlock_success_self_test(heap, 12288);
+#if defined(TANGPINGOS_TEST_USER_PROGRAMS) || defined(TANGPINGOS_TEST_EXFAT_COMMIT)
+    run_development_startup_self_tests(heap, 12288);
 #endif
-    run_usb_fat32_mount_self_test(heap, 12288);
-    run_usb_block_write_self_test(heap, 12288);
-#ifdef TANGPINGOS_TEST_EXFAT_COMMIT
-    run_usb_exfat_user_write_self_test(heap, 12288);
-    run_exfat_vfs_write_self_test(heap, 12288);
-#endif
-    cmd_ls("/");
-    cmd_cat("/ram-note.txt", heap, 256);
-    run_dup2_stdin_self_test(heap, 256);
 
     uint64_t input_fd = sys_open("/dev/tty");
     if (input_fd == (uint64_t)-1) {

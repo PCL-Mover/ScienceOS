@@ -126,6 +126,24 @@ static void select_usb_blockfs_partitions(uint64_t *exfat_partition_index,
     }
 }
 
+static void boot_status(const char *message) {
+    console_set_framebuffer_enabled(1);
+    console_write(message);
+    console_write("\n");
+    console_set_framebuffer_enabled(0);
+}
+
+static void mount_named_blockfs(const char *device_name, const char *mount_path) {
+    uint64_t index;
+
+    if (block_find_by_name(device_name, &index) == 0 &&
+        blockfs_mount(index, mount_path) != 0) {
+        console_write("[warn] block mount unavailable: ");
+        console_write(device_name);
+        console_write("\n");
+    }
+}
+
 void _start(void) {
     console_init_serial();
     console_write("TangPingOS serial online\n");
@@ -154,6 +172,7 @@ void _start(void) {
     console_write_u64(fb->bpp);
     console_write("\n");
     console_write("Starting kernel and userland...\n");
+    console_write("USB probe in progress (12 second maximum)...\n");
     console_set_framebuffer_enabled(0);
 
     if (memmap_request.response == NULL) {
@@ -189,8 +208,14 @@ void _start(void) {
     x86_64_interrupts_init();
     scheduler_init();
     pci_init();
+    boot_status("USB probe finished; continuing startup.");
+    boot_status("Initializing block devices...");
     block_init();
-    virtio_blk_init();
+    struct pci_xhci_info boot_xhci;
+    pci_get_xhci_info(&boot_xhci);
+    if (boot_xhci.reset_policy == XHCI_RESET_POLICY_QEMU) {
+        virtio_blk_init();
+    }
     partition_init();
     uint64_t usb_block_index = block_device_count();
     uint64_t usb_exfat_partition_index = UINT64_MAX;
@@ -199,16 +224,13 @@ void _start(void) {
         partition_scan_device(usb_block_index);
         select_usb_blockfs_partitions(&usb_exfat_partition_index, &usb_fat32_partition_index);
     }
+    boot_status("Initializing filesystems...");
     vfs_init();
     devfs_init();
     ramfs_init();
     initrd_init(module_request.response);
-    if (blockfs_mount(2, "/usb") != 0) {
-        console_write("[warn] /usb block mount unavailable\n");
-    }
-    if (blockfs_mount(3, "/boot") != 0) {
-        console_write("[warn] /boot block mount unavailable\n");
-    }
+    mount_named_blockfs("vd0p1", "/usb");
+    mount_named_blockfs("vd0p2", "/boot");
     if (usb_exfat_partition_index != UINT64_MAX &&
         blockfs_mount(usb_exfat_partition_index, "/usbdisk") != 0) {
         console_write("[warn] /usbdisk USB block mount unavailable\n");
@@ -217,8 +239,13 @@ void _start(void) {
         blockfs_mount(usb_fat32_partition_index, "/usbboot") != 0) {
         console_write("[warn] /usbboot USB FAT32 mount unavailable\n");
     }
+    pci_finish_usb_storage_boot_io();
+    boot_status("Starting userland...");
     user_init_from_modules(module_request.response);
+    boot_status("Init task loaded; dispatching first task...");
     scheduler_dump_tasks();
+    console_set_framebuffer_enabled(1);
+    scheduler_dispatch_first_task();
     x86_64_interrupts_enable();
 
 #ifdef TANGPINGOS_TEST_EXCEPTION
@@ -231,6 +258,8 @@ void _start(void) {
     *(volatile uint64_t *)0xffff8000dead0000ULL = 0x55;
 #endif
 
-    console_write("kernel idle loop entered\n");
-    kernel_halt();
+    for (;;) {
+        __asm__ volatile ("hlt");
+        scheduler_dispatch_first_task();
+    }
 }

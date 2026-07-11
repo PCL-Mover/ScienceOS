@@ -124,3 +124,10 @@
 - 2026-07-04: 重排 USB Mass Storage 初始化顺序，先执行 SET_CONFIGURATION，再配置 bulk endpoint，并加入 BOT reset、clear-halt 与 INQUIRY 重试。
 - 2026-07-04: 修正 xHCI PORTSC neutral write 与 USB3 warm reset fallback，并让 root port 探测优先保留 Hub/Mass Storage 的有效失败现场。
 - 2026-07-05: 修复 sysinfo 系统调用占用过大内核栈导致的 page fault，并为构建系统加入头文件依赖，避免用户态 ABI 旧对象残留。
+- 2026-07-05: 为 USB hub 枚举补充 xHCI 父 hub slot context 更新，记录 Hub/端口数/TT 信息并暴露到 usbdiag。
+- 2026-07-05: 调整 xHCI root port 探测策略，失败时继续尝试其他连接端口，全部失败后再保留最佳诊断现场。
+- 2026-07-05: 按 Linux xHCI bulk IN 处理方式为 BOT IN 传输启用 short-packet 事件，修正真实 U 盘 INQUIRY CSW 阶段兼容性。
+- 2026-07-11: 按 xHCI consumer cycle 规则重构事件环逐项消费，并兼容 USB BOT 零长度 CSW 后重读状态包。
+- 2026-07-11: 将 xHCI 命令和传输等待改为 TSC 毫秒超时，并按 Linux 时序加入 Hub 上电稳定期、状态重试和连接去抖。
+- 2026-07-11: 让内核主动派发首个用户任务，避免真机因首次 PIT 中断未到达而停在用户态启动阶段。
+- 2026-07-11: 将磁盘与 USB 回归自检移出普通 shell 启动路径，并在首次用户态切换期间保持屏幕输出可见。

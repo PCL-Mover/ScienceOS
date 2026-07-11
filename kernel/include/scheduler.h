@@ -23,6 +23,7 @@ struct scheduler_task_info {
 typedef void (*task_entry_t)(void *arg);
 
 void scheduler_init(void);
+void scheduler_dispatch_first_task(void);
 int scheduler_create_task(const char *name, task_entry_t entry, void *arg);
 int scheduler_create_user_task(const char *name, uint64_t cr3_phys,
                                uint64_t entry, uint64_t user_stack_top,

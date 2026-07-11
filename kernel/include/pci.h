@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 
+#define XHCI_RESET_POLICY_BLOCKED 0ULL
+#define XHCI_RESET_POLICY_QEMU 1ULL
+#define XHCI_RESET_POLICY_REAL_HANDOFF_OK 2ULL
+#define XHCI_RESET_POLICY_REAL_NO_LEGACY_CAP 3ULL
+
 struct pci_device {
     uint8_t bus;
     uint8_t slot;
@@ -231,6 +236,19 @@ struct pci_xhci_info {
     uint64_t hub_port_reset_port;
     uint64_t hub_port_reset_status;
     uint64_t hub_port_reset_change;
+    uint64_t hub_slot_update_attempted;
+    uint64_t hub_slot_update_ok;
+    uint64_t hub_slot_update_completion_code;
+    uint64_t hub_slot_update_slot_id;
+    uint64_t hub_slot_update_input_context_phys;
+    uint64_t hub_slot_update_context0;
+    uint64_t hub_slot_update_context1;
+    uint64_t hub_slot_update_context2;
+    uint64_t hub_slot_update_event_type;
+    uint64_t hub_slot_update_event_trb0;
+    uint64_t hub_slot_update_event_trb1;
+    uint64_t hub_slot_update_event_trb2;
+    uint64_t hub_slot_update_event_trb3;
     uint64_t configure_endpoint_attempted;
     uint64_t configure_endpoint_ok;
     uint64_t configure_endpoint_completion_code;
@@ -350,6 +368,7 @@ struct pci_xhci_info {
 
 void pci_init(void);
 int pci_register_usb_storage_block_device(void);
+void pci_finish_usb_storage_boot_io(void);
 int pci_find_device(uint16_t vendor_id, uint16_t device_id, struct pci_device *out);
 int pci_find_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if, struct pci_device *out);
 void pci_get_xhci_info(struct pci_xhci_info *out);

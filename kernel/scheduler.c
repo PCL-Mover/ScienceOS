@@ -242,6 +242,15 @@ void scheduler_init(void) {
     log_info("scheduler initialized\n");
 }
 
+void scheduler_dispatch_first_task(void) {
+    if (!scheduler_ready || task_count == 0) {
+        return;
+    }
+
+    quantum_ticks = TASK_QUANTUM_TICKS - 1;
+    __asm__ volatile ("int $0x20" ::: "memory");
+}
+
 int scheduler_create_task(const char *name, task_entry_t entry, void *arg) {
     if (task_count >= MAX_TASKS) {
         return -1;
