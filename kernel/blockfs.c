@@ -3607,12 +3607,19 @@ static uint64_t read_exfat_root_file(struct blockfs_mount *mount, struct exfat_r
     uint64_t sectors_per_cluster = one_shifted_by(mount->exfat.sectors_per_cluster_shift);
     uint64_t cluster_size = sectors_per_cluster * sizeof(sector);
 
-    if (entry->is_dir || !exfat_cluster_valid(mount, entry->first_cluster) ||
-        buffer == 0 || cluster_size == 0) {
+    if (entry->is_dir || buffer == 0 || cluster_size == 0) {
+        log_warn("exFAT read rejected: source=%s name=%s reason=invalid_request dir=%u cluster_size=%u\n",
+                 mount->source, entry->name, (uint64_t)entry->is_dir, cluster_size);
         return (uint64_t)-1;
     }
     if (offset >= entry->size || buffer_len == 0) {
         return 0;
+    }
+    if (!exfat_cluster_valid(mount, entry->first_cluster)) {
+        log_warn("exFAT read rejected: source=%s name=%s reason=invalid_first_cluster size=%u first=%u flags=%x\n",
+                 mount->source, entry->name, entry->size,
+                 (uint64_t)entry->first_cluster, (uint64_t)entry->stream_flags);
+        return (uint64_t)-1;
     }
 
     while (copied < buffer_len && offset + copied < entry->size) {
@@ -3628,12 +3635,23 @@ static uint64_t read_exfat_root_file(struct blockfs_mount *mount, struct exfat_r
         uint64_t lba;
 
         if (exfat_resolve_file_cluster(mount, entry, file_cluster_index, &cluster) != 0) {
+            log_warn("exFAT read failed: source=%s name=%s reason=cluster_resolve size=%u first=%u flags=%x index=%u\n",
+                     mount->source, entry->name, entry->size,
+                     (uint64_t)entry->first_cluster, (uint64_t)entry->stream_flags,
+                     file_cluster_index);
             return (uint64_t)-1;
         }
         lba = exfat_cluster_lba(mount, cluster);
-        if (lba == (uint64_t)-1 ||
-            sector_index >= sectors_per_cluster ||
-            block_read(mount->block_index, lba + sector_index, 1, sector) != 0) {
+        if (lba == (uint64_t)-1 || sector_index >= sectors_per_cluster) {
+            log_warn("exFAT read failed: source=%s name=%s reason=invalid_lba cluster=%u lba=%u sector=%u\n",
+                     mount->source, entry->name, (uint64_t)cluster,
+                     lba, sector_index);
+            return (uint64_t)-1;
+        }
+        if (block_read(mount->block_index, lba + sector_index, 1, sector) != 0) {
+            log_warn("exFAT read failed: source=%s name=%s reason=block_read cluster=%u lba=%u flags=%x\n",
+                     mount->source, entry->name, (uint64_t)cluster,
+                     lba + sector_index, (uint64_t)entry->stream_flags);
             return (uint64_t)-1;
         }
         if (to_copy > available) {

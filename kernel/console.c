@@ -10,7 +10,7 @@
 #define COM1 0x3f8
 #define FB_CHAR_WIDTH 8
 #define FB_CHAR_HEIGHT 16
-#define FB_WC_BASE 0xffffffffa0000000ULL
+#define FB_WC_BASE 0xffffffffb0000000ULL
 #define TEXT_MAX_COLS 512
 #define TEXT_MAX_ROWS 256
 

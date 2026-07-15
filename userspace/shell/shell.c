@@ -41,6 +41,8 @@
 #define write_u64_hex tpos_write_u64_hex
 #define write_hex_byte tpos_write_hex_byte
 
+static void cmd_usbdiag(void);
+
 static void write_dirent_name(const struct dirent *dirent) {
     uint64_t len = 0;
     while (len < DIRENT_NAME_MAX && dirent->name[len] != '\0') {
@@ -81,7 +83,8 @@ static int cmd_ls(const char *path) {
 static int cmd_cat(const char *path, char *buffer, uint64_t buffer_len) {
     static const char prefix[] = "$ cat ";
     static const char newline[] = "\n";
-    static const char fail[] = "cat: failed\n";
+    static const char open_fail[] = "cat: open failed\n";
+    static const char read_fail[] = "cat: read failed\n";
 
     write_literal(prefix, sizeof(prefix) - 1);
     write_cstr(path);
@@ -89,7 +92,7 @@ static int cmd_cat(const char *path, char *buffer, uint64_t buffer_len) {
 
     uint64_t fd = sys_open(path);
     if (fd == (uint64_t)-1) {
-        write_literal(fail, sizeof(fail) - 1);
+        write_literal(open_fail, sizeof(open_fail) - 1);
         return -1;
     }
 
@@ -97,7 +100,13 @@ static int cmd_cat(const char *path, char *buffer, uint64_t buffer_len) {
         uint64_t read_len = sys_read(fd, buffer, buffer_len);
         if (read_len == (uint64_t)-1) {
             sys_close(fd);
-            write_literal(fail, sizeof(fail) - 1);
+            write_literal(read_fail, sizeof(read_fail) - 1);
+            if (path[0] == '/' && path[1] == 'u' && path[2] == 's' &&
+                path[3] == 'b' && path[4] == 'd' && path[5] == 'i' &&
+                path[6] == 's' && path[7] == 'k' &&
+                (path[8] == '/' || path[8] == '\0')) {
+                cmd_usbdiag();
+            }
             return -1;
         }
         if (read_len == 0) {
@@ -1901,6 +1910,22 @@ static void cmd_usbdiag(void) {
     write_u64_decimal(info.xhci_bot_csw_completion_code);
     write_cstr("/");
     write_u64_decimal(info.xhci_bot_last_error_stage);
+    write_cstr("\nread10 cc cbw/data/csw/status: ");
+    write_u64_decimal(info.xhci_bot_read10_cbw_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_read10_data_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_read10_csw_completion_code);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_read10_csw_status);
+    write_cstr("\nread10 lba/tag/csw_tag/residue: ");
+    write_u64_decimal(info.xhci_bot_read10_lba);
+    write_cstr("/");
+    write_u64_hex(info.xhci_bot_read10_tag);
+    write_cstr("/");
+    write_u64_hex(info.xhci_bot_read10_csw_tag);
+    write_cstr("/");
+    write_u64_decimal(info.xhci_bot_read10_csw_residue);
     write_cstr("\nbot csw event trb: ");
     write_u64_hex(info.xhci_bot_csw_event_trb0);
     write_cstr(" ");
@@ -4147,6 +4172,53 @@ static __attribute__((unused)) void run_development_startup_self_tests(
     run_dup2_stdin_self_test(heap, 256);
 }
 
+#ifdef TANGPINGOS_TEST_MACOS_EXFAT_READ
+static void run_macos_exfat_read_self_test(char *buffer, uint64_t buffer_len) {
+    static const char expected[] = "hello from macOS exFAT\n";
+    static const char ok[] = "shell.elf: macOS exFAT read ok\n";
+    static const char fail[] = "shell.elf: macOS exFAT read failed\n";
+    uint64_t fd;
+    uint64_t read_len;
+
+    if (buffer_len < sizeof(expected)) {
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(41);
+    }
+
+    fd = sys_open("/usbdisk/hi.txt");
+    if (fd == (uint64_t)-1) {
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(41);
+    }
+    read_len = sys_read(fd, buffer, buffer_len);
+    if (read_len != sizeof(expected) - 1 ||
+        sys_read(fd, buffer + read_len, buffer_len - read_len) != 0) {
+        sys_close(fd);
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(41);
+    }
+    for (uint64_t i = 0; i < read_len; i++) {
+        if (buffer[i] != expected[i]) {
+            sys_close(fd);
+            write_literal(fail, sizeof(fail) - 1);
+            sys_exit(41);
+        }
+    }
+    sys_close(fd);
+
+    fd = sys_open("/usbdisk/empty.txt");
+    if (fd == (uint64_t)-1 || sys_read(fd, buffer, buffer_len) != 0) {
+        if (fd != (uint64_t)-1) {
+            sys_close(fd);
+        }
+        write_literal(fail, sizeof(fail) - 1);
+        sys_exit(41);
+    }
+    sys_close(fd);
+    write_literal(ok, sizeof(ok) - 1);
+}
+#endif
+
 __attribute__((noreturn))
 static void run_interactive_shell(uint64_t input_fd, char *buffer, uint64_t buffer_len) {
     static const char ready[] =
@@ -4200,6 +4272,9 @@ void _start(void) {
 
 #if defined(TANGPINGOS_TEST_USER_PROGRAMS) || defined(TANGPINGOS_TEST_EXFAT_COMMIT)
     run_development_startup_self_tests(heap, 12288);
+#endif
+#ifdef TANGPINGOS_TEST_MACOS_EXFAT_READ
+    run_macos_exfat_read_self_test(heap, 12288);
 #endif
 
     uint64_t input_fd = sys_open("/dev/tty");
