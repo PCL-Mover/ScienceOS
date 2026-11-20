@@ -37,6 +37,13 @@
 #define SYSCALL_BLOCK_WRITE 24
 #define SYSCALL_MOUNT_INFO 25
 #define SYSCALL_BLOCKFS_UNLOCK 26
+#define SYSCALL_GETUID 27
+#define SYSCALL_GETEUID 28
+#define SYSCALL_GETGID 29
+#define SYSCALL_GETEGID 30
+#define SYSCALL_SETUID 31
+#define SYSCALL_SETGID 32
+#define SYSCALL_TTY_ECHO 33
 #define SYSCALL_WRITE_CHUNK_SIZE 128
 
 static struct sys_system_info syscall_sysinfo_scratch;
@@ -495,6 +502,28 @@ struct interrupt_frame *syscall_dispatch(struct interrupt_frame *frame) {
                 (const void *)frame->rsi,
                 frame->rdx
             );
+            break;
+        case SYSCALL_GETUID:
+            frame->rax = scheduler_current_uid();
+            break;
+        case SYSCALL_GETEUID:
+            frame->rax = scheduler_current_euid();
+            break;
+        case SYSCALL_GETGID:
+            frame->rax = scheduler_current_gid();
+            break;
+        case SYSCALL_GETEGID:
+            frame->rax = scheduler_current_egid();
+            break;
+        case SYSCALL_SETUID:
+            frame->rax = scheduler_set_current_uid(frame->rdi) == 0 ? 0 : (uint64_t)-1;
+            break;
+        case SYSCALL_SETGID:
+            frame->rax = scheduler_set_current_gid(frame->rdi) == 0 ? 0 : (uint64_t)-1;
+            break;
+        case SYSCALL_TTY_ECHO:
+            tty_set_echo((int)frame->rdi);
+            frame->rax = 0;
             break;
         default:
             log_warn("unknown syscall: %u\n", frame->rax);

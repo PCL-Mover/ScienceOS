@@ -3,7 +3,7 @@
 #include <console.h>
 #include <devfs.h>
 #include <initrd.h>
-#include <limine.h>
+#include <mb2.h>
 #include <memory.h>
 #include <pci.h>
 #include <partition.h>
@@ -16,38 +16,8 @@
 #include <vfs.h>
 #include <x86_64/arch.h>
 
-__attribute__((used, section(".limine_requests")))
-static volatile uint64_t base_revision[3] = LIMINE_BASE_REVISION(3);
-
-__attribute__((used, section(".limine_requests")))
-static volatile struct limine_framebuffer_request framebuffer_request = {
-    .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
-    .revision = 0,
-};
-
-__attribute__((used, section(".limine_requests")))
-static volatile struct limine_hhdm_request hhdm_request = {
-    .id = LIMINE_HHDM_REQUEST_ID,
-    .revision = 0,
-};
-
-__attribute__((used, section(".limine_requests")))
-static volatile struct limine_memmap_request memmap_request = {
-    .id = LIMINE_MEMMAP_REQUEST_ID,
-    .revision = 0,
-};
-
-__attribute__((used, section(".limine_requests")))
-static volatile struct limine_module_request module_request = {
-    .id = LIMINE_MODULE_REQUEST_ID,
-    .revision = 0,
-};
-
-__attribute__((used, section(".limine_requests_start")))
-static volatile uint64_t requests_start_marker[4] = LIMINE_REQUESTS_START_MARKER;
-
-__attribute__((used, section(".limine_requests_end")))
-static volatile uint64_t requests_end_marker[2] = LIMINE_REQUESTS_END_MARKER;
+extern char __kernel_phys_start[];
+extern char __kernel_phys_end[];
 
 static void copy_cstr_limited(char *dst, uint64_t dst_len, const char *src) {
     uint64_t i = 0;
@@ -133,6 +103,27 @@ static void boot_status(const char *message) {
     console_set_framebuffer_enabled(0);
 }
 
+static void seed_account_database(void) {
+    /* passwd: name:uid:gid   shadow: name:salt:sha256(salt+password)   group: name:x:gid: */
+    static const char passwd[] = "root:0:0\n";
+    static const char shadow[] =
+        "root:tp0salt1:2c4149632f84ad012c21f242958a12cd4000646b0b706409e8fe8ef9bffa1da7\n";
+    static const char group[] = "root:x:0:\n";
+
+    static const char *const paths[] = {"/etc/passwd", "/etc/shadow", "/etc/group"};
+    static const char *const contents[] = {passwd, shadow, group};
+    static const uint64_t lengths[] = {
+        sizeof(passwd) - 1, sizeof(shadow) - 1, sizeof(group) - 1,
+    };
+
+    for (uint64_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (vfs_file_exists(paths[i])) {
+            continue;
+        }
+        vfs_write_file(paths[i], 0, contents[i], lengths[i]);
+    }
+}
+
 static void mount_named_blockfs(const char *device_name, const char *mount_path) {
     uint64_t index;
 
@@ -144,20 +135,19 @@ static void mount_named_blockfs(const char *device_name, const char *mount_path)
     }
 }
 
-void _start(void) {
+void kmain(uint32_t boot_magic, uint32_t mbi_phys) {
     console_init_serial();
     console_write("TangPingOS serial online\n");
 
-    if (!LIMINE_BASE_REVISION_SUPPORTED(base_revision)) {
-        kernel_halt();
+    if (boot_info_init(boot_magic, mbi_phys) != 0) {
+        kernel_panic("invalid Multiboot2 information from GRUB");
     }
 
-    if (framebuffer_request.response == NULL ||
-        framebuffer_request.response->framebuffer_count < 1) {
+    struct boot_framebuffer *fb = boot_info_framebuffer();
+    if (fb == NULL) {
         kernel_panic("no framebuffer from bootloader");
     }
 
-    struct limine_framebuffer *fb = framebuffer_request.response->framebuffers[0];
     console_init_framebuffer(fb);
 
     console_write("TangPingOS booted\n");
@@ -175,16 +165,17 @@ void _start(void) {
     console_write("USB probe in progress (12 second maximum)...\n");
     console_set_framebuffer_enabled(0);
 
-    if (memmap_request.response == NULL) {
+    struct boot_memmap *memmap = boot_info_memmap();
+    if (memmap == NULL || memmap->entry_count == 0) {
         kernel_panic("no memory map from bootloader");
     }
 
     console_write("memory map loaded: ");
-    console_write_u64(memmap_request.response->entry_count);
+    console_write_u64(memmap->entry_count);
     console_write(" entries\n");
 
-    for (uint64_t i = 0; i < memmap_request.response->entry_count && i < 6; i++) {
-        struct limine_memmap_entry *entry = memmap_request.response->entries[i];
+    for (uint64_t i = 0; i < memmap->entry_count && i < 6; i++) {
+        struct boot_memmap_entry *entry = memmap->entries[i];
         console_write("mem ");
         console_write_u64(i);
         console_write(": base ");
@@ -196,12 +187,27 @@ void _start(void) {
         console_write("\n");
     }
 
-    if (hhdm_request.response == NULL) {
-        kernel_panic("no HHDM from bootloader");
+    struct boot_modules *modules = boot_info_modules();
+
+    sysinfo_init(fb, memmap);
+    memory_init(memmap, BOOT_HHDM_OFFSET);
+
+    /*
+     * Multiboot2 memory maps from GRUB are derived from firmware data and do
+     * not exclude the loaded kernel, the modules or the information structure.
+     * Limine used to report them as reserved, so reserve them explicitly before
+     * the PMM hands those pages out.
+     */
+    uint64_t kernel_phys_start = (uint64_t)(uintptr_t)__kernel_phys_start;
+    uint64_t kernel_phys_end = (uint64_t)(uintptr_t)__kernel_phys_end;
+    memory_reserve_range(kernel_phys_start, kernel_phys_end - kernel_phys_start);
+    memory_reserve_range((uint64_t)mbi_phys, boot_info_total_size());
+    for (uint64_t i = 0; i < modules->module_count; i++) {
+        struct boot_module *module = modules->modules[i];
+        memory_reserve_range((uint64_t)(uintptr_t)module->address - BOOT_HHDM_OFFSET,
+                             module->size);
     }
 
-    sysinfo_init(fb, memmap_request.response);
-    memory_init(memmap_request.response, hhdm_request.response->offset);
     console_enable_framebuffer_write_combining();
     memory_self_test();
 
@@ -228,7 +234,8 @@ void _start(void) {
     vfs_init();
     devfs_init();
     ramfs_init();
-    initrd_init(module_request.response);
+    initrd_init(modules);
+    seed_account_database();
     mount_named_blockfs("vd0p1", "/usb");
     mount_named_blockfs("vd0p2", "/boot");
     if (usb_exfat_partition_index != UINT64_MAX &&
@@ -241,7 +248,7 @@ void _start(void) {
     }
     pci_finish_usb_storage_boot_io();
     boot_status("Starting userland...");
-    user_init_from_modules(module_request.response);
+    user_init_from_modules(modules);
     boot_status("Init task loaded; dispatching first task...");
     scheduler_dump_tasks();
     console_set_framebuffer_enabled(1);

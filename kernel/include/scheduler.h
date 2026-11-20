@@ -37,6 +37,12 @@ struct interrupt_frame *scheduler_sleep_current(struct interrupt_frame *frame, u
 struct interrupt_frame *scheduler_wait_current_for_input(struct interrupt_frame *frame);
 void scheduler_wake_input_waiters(void);
 uint64_t scheduler_current_pid(void);
+uint64_t scheduler_current_uid(void);
+uint64_t scheduler_current_euid(void);
+uint64_t scheduler_current_gid(void);
+uint64_t scheduler_current_egid(void);
+int scheduler_set_current_uid(uint64_t uid);
+int scheduler_set_current_gid(uint64_t gid);
 uint64_t scheduler_ticks(void);
 uint64_t scheduler_current_brk(void);
 uint64_t scheduler_set_current_brk(uint64_t new_break);

@@ -224,13 +224,13 @@ static void copy_child_name(char *dst, const char *src, uint64_t src_len) {
     dst[i] = '\0';
 }
 
-static struct limine_file *find_initrd_module(struct limine_module_response *modules) {
+static struct boot_module *find_initrd_module(struct boot_modules *modules) {
     if (modules == NULL) {
         return NULL;
     }
 
     for (uint64_t i = 0; i < modules->module_count; i++) {
-        struct limine_file *module = modules->modules[i];
+        struct boot_module *module = modules->modules[i];
         const char *string = module->string;
         const char *path = module->path;
 
@@ -243,8 +243,8 @@ static struct limine_file *find_initrd_module(struct limine_module_response *mod
     return NULL;
 }
 
-void initrd_init(struct limine_module_response *modules) {
-    struct limine_file *module = find_initrd_module(modules);
+void initrd_init(struct boot_modules *modules) {
+    struct boot_module *module = find_initrd_module(modules);
     file_count = 0;
 
     if (module == NULL) {
@@ -252,7 +252,8 @@ void initrd_init(struct limine_module_response *modules) {
         return;
     }
 
-    log_info("initrd module: path=%s size=%u\n", module->path, module->size);
+    log_info("initrd module: string=%s size=%u\n",
+             module->string != NULL ? module->string : "(none)", module->size);
 
     const uint8_t *cursor = (const uint8_t *)module->address;
     const uint8_t *end = cursor + module->size;
@@ -280,7 +281,7 @@ void initrd_init(struct limine_module_response *modules) {
     }
 
     if (file_count > 0 &&
-        vfs_register_fs_mount("initrd", "/", "limine-initrd",
+        vfs_register_fs_mount("initrd", "/", "grub-initrd",
                               initrd_read_file, initrd_list_dir, 0,
                               initrd_file_size, 0, 0, NULL) != 0) {
         log_error("initrd: failed to register VFS backend\n");

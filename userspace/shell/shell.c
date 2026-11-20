@@ -7,6 +7,11 @@
 
 #define sys_write tpos_write
 #define sys_getpid tpos_getpid
+#define sys_geteuid tpos_geteuid
+#define sys_getegid tpos_getegid
+#define sys_setuid tpos_setuid
+#define sys_setgid tpos_setgid
+#define sys_tty_set_echo tpos_tty_set_echo
 #define sys_yield tpos_yield
 #define sys_brk tpos_brk
 #define sys_open_flags tpos_open_flags
@@ -2398,10 +2403,503 @@ static void cmd_run(const char *path, const char *args) {
     }
 }
 
+/*
+ * Minimal account database, modelled on the POSIX layout:
+ *   /etc/passwd : name:uid:gid
+ *   /etc/shadow : name:salt:sha256(salt + password)
+ *   /etc/group  : name:x:gid:
+ */
+#define ACCOUNT_NAME_MAX 32
+#define ACCOUNT_DB_MAX 1024
+
+static uint64_t account_read_file(const char *path, char *buffer, uint64_t capacity) {
+    uint64_t fd = sys_open(path);
+    uint64_t total = 0;
+
+    if (fd == (uint64_t)-1) {
+        return 0;
+    }
+    while (total + 1 < capacity) {
+        uint64_t got = sys_read(fd, buffer + total, capacity - 1 - total);
+        if (got == 0 || got == (uint64_t)-1) {
+            break;
+        }
+        total += got;
+    }
+    sys_close(fd);
+    buffer[total] = '\0';
+    return total;
+}
+
+static int account_write_file(const char *path, const char *content) {
+    uint64_t fd = sys_open_flags(path, OPEN_CREATE | OPEN_TRUNC);
+    uint64_t len = string_length(content);
+
+    if (fd == (uint64_t)-1) {
+        return -1;
+    }
+    if (sys_write(fd, content, len) != len) {
+        sys_close(fd);
+        return -1;
+    }
+    sys_close(fd);
+    return 0;
+}
+
+static const char *account_field(const char *cursor, char *out, uint64_t capacity) {
+    uint64_t len = 0;
+
+    while (*cursor != '\0' && *cursor != ':' && *cursor != '\n') {
+        if (len + 1 < capacity) {
+            out[len++] = *cursor;
+        }
+        cursor++;
+    }
+    out[len] = '\0';
+    /* Only consume the ':' separator: the newline stays so the caller can
+       detect the end of the record after skipping trailing fields. */
+    if (*cursor == ':') {
+        cursor++;
+    }
+    return cursor;
+}
+
+static int account_lookup(const char *name, uint64_t *uid, uint64_t *gid) {
+    static char db[ACCOUNT_DB_MAX];
+    const char *cursor = db;
+
+    if (account_read_file("/etc/passwd", db, sizeof(db)) == 0) {
+        return -1;
+    }
+    while (*cursor != '\0') {
+        char field_name[ACCOUNT_NAME_MAX];
+        char field_uid[24];
+        char field_gid[24];
+        char skip[ACCOUNT_NAME_MAX];
+
+        cursor = account_field(cursor, field_name, sizeof(field_name));
+        cursor = account_field(cursor, field_uid, sizeof(field_uid));
+        cursor = account_field(cursor, field_gid, sizeof(field_gid));
+        while (*cursor != '\0' && *cursor != '\n') {
+            cursor = account_field(cursor, skip, sizeof(skip));
+        }
+        if (*cursor == '\n') {
+            cursor++;
+        }
+        if (strings_equal(field_name, name)) {
+            if (parse_u64(field_uid, uid) != 0 || parse_u64(field_gid, gid) != 0) {
+                return -1;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int account_name_by_uid(uint64_t uid, char *out, uint64_t capacity) {
+    static char db[ACCOUNT_DB_MAX];
+    const char *cursor = db;
+
+    if (account_read_file("/etc/passwd", db, sizeof(db)) == 0) {
+        return -1;
+    }
+    while (*cursor != '\0') {
+        char field_name[ACCOUNT_NAME_MAX];
+        char field_uid[24];
+        char field_gid[24];
+        char skip[ACCOUNT_NAME_MAX];
+        uint64_t value = 0;
+
+        cursor = account_field(cursor, field_name, sizeof(field_name));
+        cursor = account_field(cursor, field_uid, sizeof(field_uid));
+        cursor = account_field(cursor, field_gid, sizeof(field_gid));
+        while (*cursor != '\0' && *cursor != '\n') {
+            cursor = account_field(cursor, skip, sizeof(skip));
+        }
+        if (*cursor == '\n') {
+            cursor++;
+        }
+        if (parse_u64(field_uid, &value) == 0 && value == uid) {
+            copy_cstr_limited(out, capacity, field_name);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int account_shadow(const char *name, char *salt, uint64_t salt_cap, char *hash) {
+    static char db[ACCOUNT_DB_MAX];
+    const char *cursor = db;
+
+    if (account_read_file("/etc/shadow", db, sizeof(db)) == 0) {
+        return -1;
+    }
+    while (*cursor != '\0') {
+        char field_name[ACCOUNT_NAME_MAX];
+        char field_salt[32];
+        char field_hash[65];
+        char skip[ACCOUNT_NAME_MAX];
+
+        cursor = account_field(cursor, field_name, sizeof(field_name));
+        cursor = account_field(cursor, field_salt, sizeof(field_salt));
+        cursor = account_field(cursor, field_hash, sizeof(field_hash));
+        while (*cursor != '\0' && *cursor != '\n') {
+            cursor = account_field(cursor, skip, sizeof(skip));
+        }
+        if (*cursor == '\n') {
+            cursor++;
+        }
+        if (strings_equal(field_name, name)) {
+            copy_cstr_limited(salt, salt_cap, field_salt);
+            copy_cstr_limited(hash, 65, field_hash);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Appends one line to a database file. */
+static int account_append_line(const char *path, const char *line) {
+    static char db[ACCOUNT_DB_MAX];
+    uint64_t used = account_read_file(path, db, sizeof(db));
+
+    if (used + string_length(line) + 1 >= sizeof(db)) {
+        return -1;
+    }
+    if (used > 0 && db[used - 1] != '\n') {
+        db[used++] = '\n';
+    }
+    copy_cstr_limited(db + used, sizeof(db) - used, line);
+    used += string_length(line);
+    db[used++] = '\n';
+    db[used] = '\0';
+    return account_write_file(path, db);
+}
+
+static void read_password(const char *prompt, char *buffer, uint64_t capacity) {
+    uint64_t len = 0;
+
+    write_cstr(prompt);
+    sys_tty_set_echo(0);
+    while (len + 1 < capacity) {
+        char c = '\0';
+        if (sys_read(STDIN_FD, &c, 1) != 1 || c == '\n' || c == '\r') {
+            break;
+        }
+        buffer[len++] = c;
+    }
+    buffer[len] = '\0';
+    sys_tty_set_echo(1);
+    write_literal("\n", 1);
+}
+
+static void cmd_whoami(void) {
+    char name[ACCOUNT_NAME_MAX];
+
+    if (account_name_by_uid(sys_geteuid(), name, sizeof(name)) != 0) {
+        copy_cstr_limited(name, sizeof(name), "unknown");
+    }
+    write_cstr(name);
+    write_literal("\n", 1);
+}
+
+static void cmd_id(void) {
+    char name[ACCOUNT_NAME_MAX];
+    char group[ACCOUNT_NAME_MAX];
+
+    if (account_name_by_uid(sys_geteuid(), name, sizeof(name)) != 0) {
+        copy_cstr_limited(name, sizeof(name), "unknown");
+    }
+    if (account_name_by_uid(sys_getegid(), group, sizeof(group)) != 0) {
+        copy_cstr_limited(group, sizeof(group), "unknown");
+    }
+    write_literal("uid=", 4);
+    write_u64_decimal(sys_geteuid());
+    write_literal("(", 1);
+    write_cstr(name);
+    write_literal(") gid=", 6);
+    write_u64_decimal(sys_getegid());
+    write_literal("(", 1);
+    write_cstr(group);
+    write_literal(")\n", 2);
+}
+
+static void cmd_groups(void) {
+    char name[ACCOUNT_NAME_MAX];
+
+    if (account_name_by_uid(sys_getegid(), name, sizeof(name)) != 0) {
+        copy_cstr_limited(name, sizeof(name), "unknown");
+    }
+    write_cstr(name);
+    write_literal("\n", 1);
+}
+
+static void cmd_su(const char *args) {
+    static const char usage[] = "usage: su [user]\n";
+    static const char fail[] = "su: authentication failure\n";
+    char target[ACCOUNT_NAME_MAX];
+    char salt[32];
+    char stored[65];
+    char computed[65];
+    char password[64];
+    uint64_t uid = 0;
+    uint64_t gid = 0;
+
+    if (args[0] == '\0') {
+        copy_cstr_limited(target, sizeof(target), "root");
+    } else {
+        copy_cstr_limited(target, sizeof(target), args);
+        if (target[0] == '\0') {
+            write_literal(usage, sizeof(usage) - 1);
+            return;
+        }
+    }
+
+    if (account_lookup(target, &uid, &gid) != 0 || account_shadow(target, salt, sizeof(salt), stored) != 0) {
+        write_cstr("su: user ");
+        write_cstr(target);
+        write_literal(" does not exist\n", 16);
+        return;
+    }
+
+    read_password("Password: ", password, sizeof(password));
+    tpos_sha256_salted_hex(salt, password, computed);
+    if (!strings_equal(computed, stored)) {
+        write_literal(fail, sizeof(fail) - 1);
+        return;
+    }
+
+    if (sys_setgid(gid) != 0 || sys_setuid(uid) != 0) {
+        write_literal("su: cannot change credentials\n", 29);
+        return;
+    }
+    if (sys_spawn("/bin/shell.elf", "") != 0) {
+        write_literal("su: failed to start shell\n", 26);
+        return;
+    }
+    sys_exit(0);
+}
+
+static void cmd_useradd(const char *args) {
+    static const char denied[] = "useradd: permission denied\n";
+    static const char usage[] = "usage: useradd name\n";
+    char name[ACCOUNT_NAME_MAX];
+    char line[ACCOUNT_DB_MAX];
+    char salt[24];
+    char salt_seed[24];
+    char hash[65];
+    char uid_text[24];
+    uint64_t uid = 0;
+    uint64_t gid = 0;
+    uint64_t next_uid = 1000;
+
+    if (sys_geteuid() != 0) {
+        write_literal(denied, sizeof(denied) - 1);
+        return;
+    }
+    copy_cstr_limited(name, sizeof(name), args);
+    if (name[0] == '\0') {
+        write_literal(usage, sizeof(usage) - 1);
+        return;
+    }
+    if (account_lookup(name, &uid, &gid) == 0) {
+        write_cstr("useradd: user ");
+        write_cstr(name);
+        write_literal(" already exists\n", 16);
+        return;
+    }
+
+    /* Pick the next free uid above the existing ones. */
+    {
+        static char db[ACCOUNT_DB_MAX];
+        const char *cursor = db;
+        if (account_read_file("/etc/passwd", db, sizeof(db)) > 0) {
+            while (*cursor != '\0') {
+                char field_name[ACCOUNT_NAME_MAX];
+                char field_uid[24];
+                char field_gid[24];
+                char skip[ACCOUNT_NAME_MAX];
+                uint64_t value = 0;
+
+                cursor = account_field(cursor, field_name, sizeof(field_name));
+                cursor = account_field(cursor, field_uid, sizeof(field_uid));
+                cursor = account_field(cursor, field_gid, sizeof(field_gid));
+                while (*cursor != '\0' && *cursor != '\n') {
+                    cursor = account_field(cursor, skip, sizeof(skip));
+                }
+                if (*cursor == '\n') {
+                    cursor++;
+                }
+                if (parse_u64(field_uid, &value) == 0 && value >= next_uid) {
+                    next_uid = value + 1;
+                }
+            }
+        }
+    }
+
+    u64_to_decimal(next_uid, uid_text);
+    copy_cstr_limited(salt_seed, sizeof(salt_seed), "tp");
+    {
+        uint64_t seed_len = string_length(salt_seed);
+        copy_cstr_limited(salt_seed + seed_len, sizeof(salt_seed) - seed_len, uid_text);
+    }
+    copy_cstr_limited(salt, sizeof(salt), salt_seed);
+    tpos_sha256_salted_hex(salt, "changeme", hash);
+
+    line[0] = '\0';
+    copy_cstr_limited(line, sizeof(line), name);
+    {
+        uint64_t len = string_length(line);
+        write_literal("", 0);
+        line[len++] = ':';
+        copy_cstr_limited(line + len, sizeof(line) - len, uid_text);
+        len = string_length(line);
+        line[len++] = ':';
+        copy_cstr_limited(line + len, sizeof(line) - len, uid_text);
+        line[string_length(line)] = '\0';
+    }
+    if (account_append_line("/etc/passwd", line) != 0) {
+        write_literal("useradd: cannot update /etc/passwd\n", 35);
+        return;
+    }
+
+    line[0] = '\0';
+    copy_cstr_limited(line, sizeof(line), name);
+    {
+        uint64_t len = string_length(line);
+        line[len++] = ':';
+        copy_cstr_limited(line + len, sizeof(line) - len, salt);
+        len = string_length(line);
+        line[len++] = ':';
+        copy_cstr_limited(line + len, sizeof(line) - len, hash);
+    }
+    account_append_line("/etc/shadow", line);
+
+    line[0] = '\0';
+    copy_cstr_limited(line, sizeof(line), name);
+    {
+        uint64_t len = string_length(line);
+        copy_cstr_limited(line + len, sizeof(line) - len, ":x:");
+        len = string_length(line);
+        copy_cstr_limited(line + len, sizeof(line) - len, uid_text);
+        len = string_length(line);
+        line[len++] = ':';
+        line[len] = '\0';
+    }
+    account_append_line("/etc/group", line);
+
+    write_cstr("useradd: created ");
+    write_cstr(name);
+    write_literal(" uid=", 5);
+    write_u64_decimal(next_uid);
+    write_literal(" (initial password: changeme)\n", 30);
+}
+
+static void cmd_passwd(const char *args) {
+    static const char denied[] = "passwd: permission denied\n";
+    char target[ACCOUNT_NAME_MAX];
+    char self[ACCOUNT_NAME_MAX];
+    char old_password[64];
+    char new_password[64];
+    char confirm[64];
+    char salt[32];
+    char stored[65];
+    char computed[65];
+
+    if (account_name_by_uid(sys_geteuid(), self, sizeof(self)) != 0) {
+        copy_cstr_limited(self, sizeof(self), "unknown");
+    }
+    if (args[0] == '\0') {
+        copy_cstr_limited(target, sizeof(target), self);
+    } else {
+        copy_cstr_limited(target, sizeof(target), args);
+    }
+    if (!strings_equal(target, self) && sys_geteuid() != 0) {
+        write_literal(denied, sizeof(denied) - 1);
+        return;
+    }
+    if (account_shadow(target, salt, sizeof(salt), stored) != 0) {
+        write_cstr("passwd: unknown user ");
+        write_cstr(target);
+        write_literal("\n", 1);
+        return;
+    }
+
+    if (strings_equal(target, self)) {
+        read_password("Current password: ", old_password, sizeof(old_password));
+        tpos_sha256_salted_hex(salt, old_password, computed);
+        if (!strings_equal(computed, stored)) {
+            write_literal("passwd: authentication failure\n", 31);
+            return;
+        }
+    }
+
+    read_password("New password: ", new_password, sizeof(new_password));
+    read_password("Retype new password: ", confirm, sizeof(confirm));
+    if (!strings_equal(new_password, confirm)) {
+        write_literal("passwd: passwords do not match\n", 31);
+        return;
+    }
+
+    /* Rewrite /etc/shadow with the replaced entry. */
+    {
+        static char db[ACCOUNT_DB_MAX];
+        static char updated[ACCOUNT_DB_MAX];
+        const char *cursor = db;
+        uint64_t used = 0;
+
+        if (account_read_file("/etc/shadow", db, sizeof(db)) == 0) {
+            write_literal("passwd: cannot read /etc/shadow\n", 31);
+            return;
+        }
+        tpos_sha256_salted_hex(salt, new_password, computed);
+        updated[0] = '\0';
+        while (*cursor != '\0') {
+            char field_name[ACCOUNT_NAME_MAX];
+            const char *line_start = cursor;
+
+            cursor = account_field(cursor, field_name, sizeof(field_name));
+            while (*cursor != '\0' && *cursor != '\n') {
+                cursor++;
+            }
+            if (*cursor == '\n') {
+                cursor++;
+            }
+            if (strings_equal(field_name, target)) {
+                copy_cstr_limited(updated + used, sizeof(updated) - used, target);
+                used = string_length(updated);
+                updated[used++] = ':';
+                updated[used] = '\0';
+                copy_cstr_limited(updated + used, sizeof(updated) - used, salt);
+                used = string_length(updated);
+                updated[used++] = ':';
+                updated[used] = '\0';
+                copy_cstr_limited(updated + used, sizeof(updated) - used, computed);
+                used = string_length(updated);
+                updated[used++] = '\n';
+                updated[used] = '\0';
+            } else {
+                uint64_t line_len = (uint64_t)(cursor - line_start);
+                if (used + line_len + 1 < sizeof(updated)) {
+                    for (uint64_t i = 0; i < line_len; i++) {
+                        updated[used++] = line_start[i];
+                    }
+                    updated[used] = '\0';
+                }
+            }
+        }
+        if (account_write_file("/etc/shadow", updated) != 0) {
+            write_literal("passwd: cannot update /etc/shadow\n", 33);
+            return;
+        }
+    }
+
+    write_literal("passwd: password updated\n", 25);
+}
+
 static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_t buffer_len) {
     static const char help[] =
-        "commands: help, pwd, cd, ls, cat, echo, clear, touch, write, append, rm, stat, cp, mv, hexdump, edit, run, ps, mem, uptime, sysinfo, usb, usbdiag, mounts, lsblk, blkread, blkwrite, usbtestwrite, writeaudit, writeunlock\n";
-    static const char unknown[] = "unknown command\n";
+        "commands: help, pwd, cd, ls, cat, echo, clear, touch, write, append, rm, stat, cp, mv, hexdump, edit, run, ps, mem, uptime, sysinfo, usb, usbdiag, mounts, lsblk, blkread, blkwrite, usbtestwrite, writeaudit, writeunlock, whoami, id, groups, su, passwd, useradd\n";
     static const char usage_blkread[] = "usage: blkread device lba\n";
     static const char usage_blkwrite[] = "usage: blkwrite device lba text\n";
     static const char usage_cat[] = "usage: cat /path\n";
@@ -2463,6 +2961,38 @@ static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_
     }
     if (strings_equal(line, "sysinfo")) {
         cmd_sysinfo();
+        return;
+    }
+    if (strings_equal(line, "whoami")) {
+        cmd_whoami();
+        return;
+    }
+    if (strings_equal(line, "id")) {
+        cmd_id();
+        return;
+    }
+    if (strings_equal(line, "groups")) {
+        cmd_groups();
+        return;
+    }
+    if (strings_equal(line, "su")) {
+        cmd_su("");
+        return;
+    }
+    if (starts_with(line, "su ")) {
+        cmd_su(skip_spaces(line + 3));
+        return;
+    }
+    if (strings_equal(line, "passwd")) {
+        cmd_passwd("");
+        return;
+    }
+    if (starts_with(line, "passwd ")) {
+        cmd_passwd(skip_spaces(line + 7));
+        return;
+    }
+    if (starts_with(line, "useradd ")) {
+        cmd_useradd(skip_spaces(line + 8));
         return;
     }
     if (strings_equal(line, "usb")) {
@@ -2771,7 +3301,13 @@ static void run_shell_command(const char *line, char *cwd, char *buffer, uint64_
         return;
     }
 
-    write_literal(unknown, sizeof(unknown) - 1);
+    {
+        static const char not_found[] = "sh: command not found: ";
+        const char *end = find_space(line);
+        write_literal(not_found, sizeof(not_found) - 1);
+        write_literal(line, (uint64_t)(end - line));
+        write_literal("\n", 1);
+    }
 }
 
 static void run_shell_script_self_test(char *buffer, uint64_t buffer_len) {
@@ -4224,8 +4760,7 @@ static void run_interactive_shell(uint64_t input_fd, char *buffer, uint64_t buff
     static const char ready[] =
         "\fshell.elf: interactive shell ready\n"
         "TangPingOS is ready. Type help for commands.\n";
-    static const char prompt_prefix[] = "TangPingOS:";
-    static const char prompt_suffix[] = "> ";
+    char user[ACCOUNT_NAME_MAX];
     char line[SHELL_LINE_MAX];
     char cwd[SHELL_PATH_MAX];
 
@@ -4235,9 +4770,13 @@ static void run_interactive_shell(uint64_t input_fd, char *buffer, uint64_t buff
 
     write_literal(ready, sizeof(ready) - 1);
     for (;;) {
-        write_literal(prompt_prefix, sizeof(prompt_prefix) - 1);
+        if (account_name_by_uid(sys_geteuid(), user, sizeof(user)) != 0) {
+            copy_cstr_limited(user, sizeof(user), "unknown");
+        }
+        write_cstr(user);
+        write_literal("@x86:", 5);
         write_cstr(cwd);
-        write_literal(prompt_suffix, sizeof(prompt_suffix) - 1);
+        write_literal(sys_geteuid() == 0 ? "# " : "$ ", 2);
         read_line(input_fd, line, sizeof(line));
         run_shell_command(line, cwd, buffer, buffer_len);
     }

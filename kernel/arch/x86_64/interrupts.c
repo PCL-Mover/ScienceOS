@@ -350,6 +350,9 @@ struct interrupt_frame *x86_64_interrupt_handler(struct interrupt_frame *frame) 
             case 1:
                 keyboard_handle();
                 break;
+            case 4:
+                console_handle_serial_input();
+                break;
             default:
                 log_warn("unhandled irq %u\n", (uint64_t)irq);
                 break;
@@ -383,7 +386,8 @@ void x86_64_interrupts_init(void) {
     }
     pic_set_mask(0, 0);
     pic_set_mask(1, 0);
-    log_info("PIC remapped: IRQ0 timer, IRQ1 keyboard unmasked\n");
+    pic_set_mask(4, 0);
+    log_info("PIC remapped: IRQ0 timer, IRQ1 keyboard, IRQ4 serial unmasked\n");
 
     pit_init(100);
     log_info("PIT timer configured: 100 Hz\n");

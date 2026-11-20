@@ -52,6 +52,10 @@ struct task_open_file {
 struct task {
     uint64_t pid;
     char name[TASK_NAME_MAX];
+    uint64_t uid;
+    uint64_t euid;
+    uint64_t gid;
+    uint64_t egid;
     uint8_t *stack;
     uint64_t stack_size;
     uint64_t kernel_stack_top;
@@ -307,6 +311,13 @@ int scheduler_create_user_task(const char *name, uint64_t cr3_phys,
     task->brk_start = brk_start;
     task->brk_current = brk_start;
     task->brk_limit = brk_limit;
+
+    if (current_task != 0) {
+        task->uid = current_task->euid;
+        task->euid = current_task->euid;
+        task->gid = current_task->egid;
+        task->egid = current_task->egid;
+    }
 
     uint64_t kernel_stack_top = align_down((uint64_t)task->stack + TASK_STACK_SIZE, 16) - 8;
     struct interrupt_frame *frame =
@@ -569,6 +580,46 @@ uint64_t scheduler_current_pid(void) {
     }
 
     return current_task->pid;
+}
+
+uint64_t scheduler_current_uid(void) {
+    return current_task == NULL ? 0 : current_task->uid;
+}
+
+uint64_t scheduler_current_euid(void) {
+    return current_task == NULL ? 0 : current_task->euid;
+}
+
+uint64_t scheduler_current_gid(void) {
+    return current_task == NULL ? 0 : current_task->gid;
+}
+
+uint64_t scheduler_current_egid(void) {
+    return current_task == NULL ? 0 : current_task->egid;
+}
+
+int scheduler_set_current_uid(uint64_t uid) {
+    if (current_task == NULL) {
+        return -1;
+    }
+    if (current_task->euid != 0 && uid != current_task->uid) {
+        return -1;
+    }
+    current_task->uid = uid;
+    current_task->euid = uid;
+    return 0;
+}
+
+int scheduler_set_current_gid(uint64_t gid) {
+    if (current_task == NULL) {
+        return -1;
+    }
+    if (current_task->euid != 0 && gid != current_task->gid) {
+        return -1;
+    }
+    current_task->gid = gid;
+    current_task->egid = gid;
+    return 0;
 }
 
 uint64_t scheduler_ticks(void) {

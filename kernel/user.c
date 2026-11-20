@@ -1,5 +1,5 @@
 #include <console.h>
-#include <limine.h>
+#include <mb2.h>
 #include <log.h>
 #include <memory.h>
 #include <scheduler.h>
@@ -314,15 +314,15 @@ static int range_overlaps_stack(uint64_t start, uint64_t end) {
     return start < USER_STACK_TOP && end > stack_start;
 }
 
-static struct limine_file *find_init_module(struct limine_module_response *modules) {
+static struct boot_module *find_init_module(struct boot_modules *modules) {
     if (modules == 0) {
         kernel_panic("no module response from bootloader");
     }
 
-    log_debug("Limine modules: %u\n", modules->module_count);
+    log_debug("boot modules: %u\n", modules->module_count);
 
     for (uint64_t i = 0; i < modules->module_count; i++) {
-        struct limine_file *module = modules->modules[i];
+        struct boot_module *module = modules->modules[i];
         log_debug("module %u: path=%s string=%s size=%u\n",
                   i, safe_string(module->path), safe_string(module->string), module->size);
 
@@ -483,8 +483,8 @@ static struct user_image load_elf_image(const uint8_t *image, uint64_t image_siz
     return loaded;
 }
 
-void user_init_from_modules(struct limine_module_response *modules) {
-    struct limine_file *init_module = find_init_module(modules);
+void user_init_from_modules(struct boot_modules *modules) {
+    struct boot_module *init_module = find_init_module(modules);
     uint64_t cr3_phys = vmm_create_address_space();
     struct user_image image = load_elf_image(init_module->address, init_module->size,
                                              cr3_phys, "init");

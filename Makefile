@@ -8,40 +8,30 @@ USER_SHELL := $(BUILD_DIR)/shell.elf
 HELLO := $(BUILD_DIR)/hello.elf
 LS := $(BUILD_DIR)/ls.elf
 CAT := $(BUILD_DIR)/cat.elf
+LOGIN := $(BUILD_DIR)/login.elf
 INITRD := $(BUILD_DIR)/initrd.tar
 ISO := $(BUILD_DIR)/TangPingOS.iso
+GRUB_EFI := $(BUILD_DIR)/bootx64.efi
+EFI_IMG := $(BUILD_DIR)/efi.img
 DISK := $(BUILD_DIR)/disk.img
 USB_DISK := $(BUILD_DIR)/usb.img
 USB_GPT_DISK := $(BUILD_DIR)/usb-gpt.img
 
 BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
 LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
-LIMINE_PREFIX := $(shell brew --prefix limine 2>/dev/null)
+GRUB_PREFIX ?= /Users/mac/opt/grub-x86_64-elf
 QEMU_PREFIX := $(shell brew --prefix qemu 2>/dev/null)
 
-CC := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/clang,clang)
-LD := $(if $(shell command -v ld.lld 2>/dev/null),ld.lld,$(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/ld.lld,ld.lld))
+CC := $(firstword $(wildcard $(LLVM_PREFIX)/bin/clang) $(shell command -v clang 2>/dev/null) clang)
+LD := $(firstword $(shell command -v ld.lld 2>/dev/null) $(wildcard $(LLVM_PREFIX)/bin/ld.lld) ld.lld)
 QEMU := qemu-system-x86_64
 XORRISO := xorriso
-LIMINE := limine
+GRUB_MKSTANDALONE := $(GRUB_PREFIX)/bin/x86_64-elf-grub-mkstandalone
+GRUB_MODDIR := $(GRUB_PREFIX)/lib/x86_64-elf/grub/x86_64-efi
+MFORMAT := mformat
+MCOPY := mcopy
+MMD := mmd
 TAR := tar
-
-LIMINE_BIOS_SYS := $(firstword \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/limine-bios.sys) \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/limine-bios-cd.bin))
-LIMINE_BIOS_CD := $(firstword \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/limine-bios-cd.bin))
-LIMINE_UEFI_CD := $(firstword \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/limine-uefi-cd.bin) \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/BOOTX64.EFI))
-LIMINE_BOOTX64 := $(firstword \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/BOOTX64.EFI) \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/BOOTX64.efi) \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/limine_x64.efi))
-LIMINE_BOOTIA32 := $(firstword \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/BOOTIA32.EFI) \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/BOOTIA32.efi) \
-	$(wildcard $(LIMINE_PREFIX)/share/limine/limine_ia32.efi))
 
 OVMF_CODE := $(firstword \
 	$(wildcard $(QEMU_PREFIX)/share/qemu/edk2-x86_64-code.fd) \
@@ -49,7 +39,8 @@ OVMF_CODE := $(firstword \
 	$(wildcard $(BREW_PREFIX)/share/qemu/edk2-x86_64-code.fd) \
 	$(wildcard $(BREW_PREFIX)/share/qemu/edk2-x86_64-code.fd.bz2) \
 	$(wildcard /opt/homebrew/share/qemu/edk2-x86_64-code.fd) \
-	$(wildcard /usr/local/share/qemu/edk2-x86_64-code.fd))
+	$(wildcard /usr/local/share/qemu/edk2-x86_64-code.fd) \
+	$(wildcard /opt/local/share/qemu/edk2-x86_64-code.fd))
 
 CFLAGS := \
 	-target x86_64-elf \
@@ -130,8 +121,10 @@ LS_SOURCES := $(shell find userspace/ls -name '*.c' 2>/dev/null)
 LS_OBJECTS := $(patsubst userspace/%.c,$(BUILD_DIR)/userspace/%.o,$(LS_SOURCES))
 CAT_SOURCES := $(shell find userspace/cat -name '*.c' 2>/dev/null)
 CAT_OBJECTS := $(patsubst userspace/%.c,$(BUILD_DIR)/userspace/%.o,$(CAT_SOURCES))
+LOGIN_SOURCES := $(shell find userspace/login -name '*.c' 2>/dev/null)
+LOGIN_OBJECTS := $(patsubst userspace/%.c,$(BUILD_DIR)/userspace/%.o,$(LOGIN_SOURCES))
 INITRD_FILES := $(shell find initrd -type f 2>/dev/null)
-INITRD_PACKED_PATHS := $(patsubst initrd/%,%,$(INITRD_FILES)) bin/shell.elf bin/hello.elf bin/ls.elf bin/cat.elf
+INITRD_PACKED_PATHS := $(patsubst initrd/%,%,$(INITRD_FILES)) bin/shell.elf bin/hello.elf bin/ls.elf bin/cat.elf bin/login.elf
 
 .PHONY: all kernel init shell hello ls cat initrd iso disk usb-disk usb-gpt-disk run test-exception test-page-fault test-user-fault test-user-programs test-exfat-commit clean check-tools check-uefi
 
@@ -213,7 +206,10 @@ $(LS): $(LS_OBJECTS) $(USER_LIB_OBJECTS) linker/user.ld | $(BUILD_DIR)
 $(CAT): $(CAT_OBJECTS) $(USER_LIB_OBJECTS) linker/user.ld | $(BUILD_DIR)
 	$(LD) $(USER_LDFLAGS) $(CAT_OBJECTS) $(USER_LIB_OBJECTS) -o $@
 
-$(INITRD): $(INITRD_FILES) $(USER_SHELL) $(HELLO) $(LS) $(CAT) | $(BUILD_DIR)
+$(LOGIN): $(LOGIN_OBJECTS) $(USER_LIB_OBJECTS) linker/user.ld | $(BUILD_DIR)
+	$(LD) $(USER_LDFLAGS) $(LOGIN_OBJECTS) $(USER_LIB_OBJECTS) -o $@
+
+$(INITRD): $(INITRD_FILES) $(USER_SHELL) $(HELLO) $(LS) $(CAT) $(LOGIN) | $(BUILD_DIR)
 	rm -rf $(INITRD_ROOT)
 	mkdir -p $(INITRD_ROOT)/bin
 	cp -R initrd/. $(INITRD_ROOT)/
@@ -221,6 +217,7 @@ $(INITRD): $(INITRD_FILES) $(USER_SHELL) $(HELLO) $(LS) $(CAT) | $(BUILD_DIR)
 	cp $(HELLO) $(INITRD_ROOT)/bin/hello.elf
 	cp $(LS) $(INITRD_ROOT)/bin/ls.elf
 	cp $(CAT) $(INITRD_ROOT)/bin/cat.elf
+	cp $(LOGIN) $(INITRD_ROOT)/bin/login.elf
 	$(TAR) --format=ustar -cf $@ -C $(INITRD_ROOT) $(INITRD_PACKED_PATHS)
 
 $(BUILD_DIR)/kernel/%.o: kernel/%.c | $(BUILD_DIR)
@@ -235,35 +232,32 @@ $(BUILD_DIR)/userspace/%.o: userspace/%.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(ISO): $(KERNEL) $(INIT) $(INITRD) boot/limine.conf
+$(ISO): $(KERNEL) $(INIT) $(INITRD) boot/grub.cfg
 	rm -rf $(ISO_ROOT)
-	mkdir -p $(ISO_ROOT)/EFI/BOOT
-	cp $(KERNEL) $(ISO_ROOT)/kernel.elf
-	cp $(INIT) $(ISO_ROOT)/init.elf
-	cp $(INITRD) $(ISO_ROOT)/initrd.tar
-	cp boot/limine.conf $(ISO_ROOT)/limine.conf
-	cp $(LIMINE_BIOS_SYS) $(ISO_ROOT)/limine-bios.sys
-	cp $(LIMINE_BIOS_CD) $(ISO_ROOT)/limine-bios-cd.bin
-	cp $(LIMINE_UEFI_CD) $(ISO_ROOT)/limine-uefi-cd.bin
-	@if [ -n "$(LIMINE_BOOTX64)" ]; then cp "$(LIMINE_BOOTX64)" $(ISO_ROOT)/EFI/BOOT/BOOTX64.EFI; fi
-	@if [ -n "$(LIMINE_BOOTIA32)" ]; then cp "$(LIMINE_BOOTIA32)" $(ISO_ROOT)/EFI/BOOT/BOOTIA32.EFI; fi
+	mkdir -p $(ISO_ROOT)/EFI/BOOT $(ISO_ROOT)/boot
+	cp $(KERNEL) $(ISO_ROOT)/boot/kernel.elf
+	cp $(INIT) $(ISO_ROOT)/boot/init.elf
+	cp $(INITRD) $(ISO_ROOT)/boot/initrd.tar
+	$(GRUB_MKSTANDALONE) -O x86_64-efi --fonts= --themes= --locales= \
+		-d $(GRUB_MODDIR) -o $(GRUB_EFI) \
+		"boot/grub/grub.cfg=boot/grub.cfg"
+	rm -f $(EFI_IMG)
+	dd if=/dev/zero of=$(EFI_IMG) bs=1024 count=16384
+	$(MFORMAT) -i $(EFI_IMG) -v EFI ::
+	$(MMD) -i $(EFI_IMG) ::EFI
+	$(MMD) -i $(EFI_IMG) ::EFI/BOOT
+	$(MCOPY) -i $(EFI_IMG) $(GRUB_EFI) ::EFI/BOOT/BOOTX64.EFI
+	cp $(EFI_IMG) $(ISO_ROOT)/EFI/BOOT/efi.img
 	$(XORRISO) -as mkisofs \
 		-R \
 		-r \
 		-J \
-		-b limine-bios-cd.bin \
+		-eltorito-alt-boot \
+		-e EFI/BOOT/efi.img \
 		-no-emul-boot \
-		-boot-load-size 4 \
-		-boot-info-table \
-		-hfsplus \
-		-apm-block-size 2048 \
-		--efi-boot limine-uefi-cd.bin \
-		-efi-boot-part \
-		--efi-boot-image \
 		--protective-msdos-label \
 		$(ISO_ROOT) \
 		-o $(ISO)
-	$(LIMINE) bios-install $(ISO)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -282,13 +276,13 @@ check-tools:
 	@command -v $(LD) >/dev/null || { echo "Missing ld.lld. Install with: brew install lld"; exit 1; }
 	@command -v $(QEMU) >/dev/null || { echo "Missing qemu-system-x86_64. Install with: brew install qemu"; exit 1; }
 	@command -v $(XORRISO) >/dev/null || { echo "Missing xorriso. Install with: brew install xorriso"; exit 1; }
-	@command -v $(LIMINE) >/dev/null || { echo "Missing limine. Install with: brew install limine"; exit 1; }
 	@command -v $(TAR) >/dev/null || { echo "Missing tar."; exit 1; }
-	@[ -f kernel/include/limine.h ] || { echo "Missing kernel/include/limine.h"; exit 1; }
-	@[ -n "$(LIMINE_BIOS_SYS)" ] || { echo "Missing limine-bios.sys. Install with: brew install limine"; exit 1; }
-	@[ -n "$(LIMINE_BIOS_CD)" ] || { echo "Missing limine-bios-cd.bin. Install with: brew install limine"; exit 1; }
-	@[ -n "$(LIMINE_UEFI_CD)" ] || { echo "Missing limine-uefi-cd.bin. Install with: brew install limine"; exit 1; }
-	@[ -n "$(LIMINE_BOOTX64)" ] || { echo "Missing Limine BOOTX64.EFI. Install with: brew install limine"; exit 1; }
+	@command -v $(MFORMAT) >/dev/null || { echo "Missing mformat (mtools). Install with: brew install mtools"; exit 1; }
+	@command -v $(MCOPY) >/dev/null || { echo "Missing mcopy (mtools). Install with: brew install mtools"; exit 1; }
+	@command -v $(MMD) >/dev/null || { echo "Missing mmd (mtools). Install with: brew install mtools"; exit 1; }
+	@[ -x $(GRUB_MKSTANDALONE) ] || { echo "Missing $(GRUB_MKSTANDALONE)"; exit 1; }
+	@[ -d $(GRUB_MODDIR) ] || { echo "Missing GRUB module directory $(GRUB_MODDIR)"; exit 1; }
+	@[ -f kernel/include/mb2.h ] || { echo "Missing kernel/include/mb2.h"; exit 1; }
 
 check-uefi:
 	@[ -n "$(OVMF_CODE)" ] || { \

@@ -78,7 +78,7 @@ static void detect_cpu_name(char *out, uint64_t out_len) {
     copy_bytes(out, vendor, out_len);
 }
 
-void sysinfo_init(struct limine_framebuffer *framebuffer, struct limine_memmap_response *memmap) {
+void sysinfo_init(struct boot_framebuffer *framebuffer, struct boot_memmap *memmap) {
     zero_bytes(&boot_info, sizeof(boot_info));
 
     if (framebuffer != 0) {

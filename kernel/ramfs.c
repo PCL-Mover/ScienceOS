@@ -36,13 +36,18 @@ static int ramfs_path_valid(const char *path) {
         return 0;
     }
 
-    for (uint64_t i = 1; path[i] != '\0'; i++) {
-        if (path[i] == '/') {
+    uint64_t len = 0;
+    while (path[len] != '\0') {
+        len++;
+        if (len >= RAMFS_NAME_MAX) {
             return 0;
         }
-        if (i + 1 >= RAMFS_NAME_MAX) {
+        if (path[len - 1] == '/' && path[len] == '/') {
             return 0;
         }
+    }
+    if (path[len - 1] == '/') {
+        return 0;
     }
 
     return 1;
@@ -136,6 +141,19 @@ static int ramfs_list(const char *path, uint64_t index, struct vfs_dirent *out, 
     for (uint64_t i = 0; i < RAMFS_MAX_FILES; i++) {
         if (!files[i].in_use) {
             continue;
+        }
+        /* Nested files (e.g. /etc/passwd) are reached by path, not listed flat. */
+        {
+            int nested = 0;
+            for (uint64_t j = 1; files[i].name[j] != '\0'; j++) {
+                if (files[i].name[j] == '/') {
+                    nested = 1;
+                    break;
+                }
+            }
+            if (nested) {
+                continue;
+            }
         }
         if (seen == index) {
             copy_dirent_name(out->name, files[i].name);

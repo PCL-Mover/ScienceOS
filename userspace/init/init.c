@@ -19,13 +19,13 @@ void _start(void) {
         tpos_exit(11);
     }
 
-    tpos_write_cstr("init.elf: spawning /bin/shell.elf\n");
-    if (tpos_spawn("/bin/shell.elf", "") != 0) {
-        tpos_write_cstr("init.elf: failed to spawn shell\n");
+    tpos_write_cstr("init.elf: spawning /bin/login.elf\n");
+    if (tpos_spawn("/bin/login.elf", "") != 0) {
+        tpos_write_cstr("init.elf: failed to spawn login\n");
         tpos_exit(12);
     }
 
-    tpos_write_cstr("init.elf: shell started\n");
+    tpos_write_cstr("init.elf: login started\n");
     for (;;) {
         tpos_sleep_ticks(100);
         tpos_yield();

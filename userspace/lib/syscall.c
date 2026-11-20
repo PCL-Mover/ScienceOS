@@ -41,6 +41,34 @@ uint64_t tpos_getpid(void) {
     return tpos_syscall2(SYS_GETPID, 0, 0);
 }
 
+uint64_t tpos_getuid(void) {
+    return tpos_syscall2(SYS_GETUID, 0, 0);
+}
+
+uint64_t tpos_geteuid(void) {
+    return tpos_syscall2(SYS_GETEUID, 0, 0);
+}
+
+uint64_t tpos_getgid(void) {
+    return tpos_syscall2(SYS_GETGID, 0, 0);
+}
+
+uint64_t tpos_getegid(void) {
+    return tpos_syscall2(SYS_GETEGID, 0, 0);
+}
+
+uint64_t tpos_setuid(uint64_t uid) {
+    return tpos_syscall2(SYS_SETUID, uid, 0);
+}
+
+uint64_t tpos_setgid(uint64_t gid) {
+    return tpos_syscall2(SYS_SETGID, gid, 0);
+}
+
+void tpos_tty_set_echo(int enabled) {
+    (void)tpos_syscall2(SYS_TTY_ECHO, enabled ? 1 : 0, 0);
+}
+
 void tpos_yield(void) {
     tpos_syscall2(SYS_YIELD, 0, 0);
 }

@@ -1,6 +1,6 @@
 #include <console.h>
-#include <limine.h>
 #include <log.h>
+#include <mb2.h>
 #include <memory.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -632,7 +632,7 @@ void kfree(void *ptr) {
     heap_coalesce(block);
 }
 
-void memory_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
+void memory_init(struct boot_memmap *memmap, uint64_t hhdm_offset) {
     hhdm_base = hhdm_offset;
     kernel_cr3 = read_cr3() & PTE_ADDR_MASK;
     pat_enable_write_combining();
@@ -646,7 +646,7 @@ void memory_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
     }
 
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
-        struct limine_memmap_entry *entry = memmap->entries[i];
+        struct boot_memmap_entry *entry = memmap->entries[i];
         uint64_t end = entry->base + entry->length;
         uint64_t page_end = align_up(end, PAGE_SIZE) / PAGE_SIZE;
 
@@ -668,7 +668,7 @@ void memory_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
             }
         }
 
-        if (entry->type == LIMINE_MEMMAP_USABLE) {
+        if (entry->type == MULTIBOOT2_MEMORY_AVAILABLE) {
             pmm_mark_range_free(entry->base, entry->length);
         }
     }
@@ -678,6 +678,18 @@ void memory_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
     log_info("PAT configured: PWT cache index uses write-combining\n");
     log_info("PMM initialized: managed pages %u free pages %u\n",
              pmm_managed_page_count, pmm_free_page_count);
+}
+
+void memory_reserve_range(uint64_t base, uint64_t length) {
+    uint64_t start = align_down(base, PAGE_SIZE);
+    uint64_t end = align_up(base + length, PAGE_SIZE);
+
+    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+        uint64_t page = addr / PAGE_SIZE;
+        if (page < PMM_MAX_PAGES) {
+            pmm_set_used(page);
+        }
+    }
 }
 
 void memory_self_test(void) {

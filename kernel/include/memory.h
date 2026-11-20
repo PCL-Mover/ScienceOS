@@ -1,7 +1,7 @@
 #ifndef TANGPINGOS_MEMORY_H
 #define TANGPINGOS_MEMORY_H
 
-#include <limine.h>
+#include <mb2.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,7 +12,8 @@
 #define VMM_FLAG_UNCACHED (1ULL << 4)
 #define VMM_FLAG_NO_EXEC  (1ULL << 63)
 
-void memory_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset);
+void memory_init(struct boot_memmap *memmap, uint64_t hhdm_offset);
+void memory_reserve_range(uint64_t base, uint64_t length);
 void memory_self_test(void);
 void *phys_to_virt(uint64_t phys_addr);
 uint64_t pmm_alloc_page(void);

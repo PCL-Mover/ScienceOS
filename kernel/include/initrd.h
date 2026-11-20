@@ -1,8 +1,8 @@
 #ifndef TANGPINGOS_INITRD_H
 #define TANGPINGOS_INITRD_H
 
-#include <limine.h>
+#include <mb2.h>
 
-void initrd_init(struct limine_module_response *modules);
+void initrd_init(struct boot_modules *modules);
 
 #endif

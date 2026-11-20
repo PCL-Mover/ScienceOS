@@ -1,7 +1,7 @@
 #ifndef TANGPINGOS_SYSINFO_H
 #define TANGPINGOS_SYSINFO_H
 
-#include <limine.h>
+#include <mb2.h>
 #include <stdint.h>
 
 #define SYSINFO_CPU_NAME_MAX 64
@@ -371,7 +371,7 @@ struct sys_system_info {
     char cpu_name[SYSINFO_CPU_NAME_MAX];
 };
 
-void sysinfo_init(struct limine_framebuffer *framebuffer, struct limine_memmap_response *memmap);
+void sysinfo_init(struct boot_framebuffer *framebuffer, struct boot_memmap *memmap);
 void sysinfo_get_meminfo(struct sys_meminfo *out);
 void sysinfo_get_system_info(struct sys_system_info *out);
 

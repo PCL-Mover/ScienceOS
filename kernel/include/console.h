@@ -4,10 +4,11 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-struct limine_framebuffer;
+struct boot_framebuffer;
 
 void console_init_serial(void);
-void console_init_framebuffer(struct limine_framebuffer *framebuffer);
+void console_handle_serial_input(void);
+void console_init_framebuffer(struct boot_framebuffer *framebuffer);
 void console_set_framebuffer_enabled(int enabled);
 void console_set_screen_output_suppressed(int suppressed);
 void console_clear_framebuffer(void);

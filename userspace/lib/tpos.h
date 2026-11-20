@@ -27,6 +27,13 @@
 #define SYS_BLOCK_WRITE 24
 #define SYS_MOUNT_INFO 25
 #define SYS_BLOCKFS_UNLOCK 26
+#define SYS_GETUID 27
+#define SYS_GETEUID 28
+#define SYS_GETGID 29
+#define SYS_GETEGID 30
+#define SYS_SETUID 31
+#define SYS_SETGID 32
+#define SYS_TTY_ECHO 33
 
 #define BLOCKFS_UNLOCK_MAGIC 0x5450555342575249ULL
 
@@ -461,6 +468,15 @@ uint64_t tpos_syscall4(uint64_t number, uint64_t arg0, uint64_t arg1, uint64_t a
 
 uint64_t tpos_write(uint64_t fd, const char *buffer, uint64_t length);
 uint64_t tpos_getpid(void);
+uint64_t tpos_getuid(void);
+uint64_t tpos_geteuid(void);
+uint64_t tpos_getgid(void);
+uint64_t tpos_getegid(void);
+uint64_t tpos_setuid(uint64_t uid);
+uint64_t tpos_setgid(uint64_t gid);
+void tpos_tty_set_echo(int enabled);
+void tpos_sha256_hex(const void *data, uint64_t len, char out[65]);
+void tpos_sha256_salted_hex(const char *salt, const char *password, char out[65]);
 void tpos_yield(void);
 void tpos_sleep_ticks(uint64_t ticks);
 uint64_t tpos_brk(uint64_t new_break);
